@@ -873,6 +873,17 @@ def test_curator_review_prompt_has_invariants():
     assert "consolidat" in CURATOR_REVIEW_PROMPT.lower() or "merge" in CURATOR_REVIEW_PROMPT.lower()
 
 
+def test_curator_review_prompt_requires_same_turn_skill_view_before_mutation():
+    from agent.curator import CURATOR_REVIEW_PROMPT
+
+    prompt = CURATOR_REVIEW_PROMPT.lower()
+
+    assert "before every skill_manage action that changes an existing skill" in prompt
+    assert "call skill_view for that exact target" in prompt
+    assert "wait for its result" in prompt
+    assert "later tool step" in prompt
+
+
 def test_curator_review_prompt_points_at_existing_tools_only():
     """The review prompt must rely on existing tools (skill_manage + terminal)
     and must NOT reference bespoke curator tools that are not registered
