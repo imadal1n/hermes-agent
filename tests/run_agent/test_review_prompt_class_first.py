@@ -17,6 +17,10 @@ snapshot the full prompt text (change-detector).
 from run_agent import AIAgent
 
 
+def _normalize_prompt(prompt: str) -> str:
+    return " ".join(prompt.lower().split())
+
+
 # ---------------------------------------------------------------------------
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
@@ -60,6 +64,22 @@ def test_skill_review_prompt_prefers_loaded_skills_first():
     # Must name the mechanisms for detecting loaded skills
     assert "skill_view" in prompt and "/skill" in prompt, (
         "must name skill_view and /skill-name as loaded-skill signals"
+    )
+
+
+def test_skill_review_prompt_requires_same_turn_exact_target_view_before_manage():
+    prompt = _normalize_prompt(AIAgent._SKILL_REVIEW_PROMPT)
+    expected_rule = (
+        "before every `skill_manage` action that changes an existing skill, call the exact target `skill_view`: "
+        "use `skill_view(name)` for skill.md and `skill_view(name, file_path=...)` for an existing support file. "
+        "wait for the result, then mutate in a later tool step. candidate lists and transcripts are insufficient; "
+        "do not put the read and write in the same batch. if `_read_before_write_required` occurs, read first and "
+        "retry with the returned content."
+    ).lower()
+
+    assert expected_rule in prompt, "must spell out the complete read-before-write rule as a standalone paragraph"
+    assert prompt.index(expected_rule) < prompt.index("preference order"), (
+        "must place the reusable instruction before the preference-order heading"
     )
 
 
@@ -154,6 +174,22 @@ def test_combined_review_prompt_prefers_loaded_skills_first():
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "LOADED" in prompt or "loaded" in prompt
     assert "skill_view" in prompt and "/skill" in prompt
+
+
+def test_combined_review_prompt_requires_same_turn_exact_target_view_before_manage():
+    prompt = _normalize_prompt(AIAgent._COMBINED_REVIEW_PROMPT)
+    expected_rule = (
+        "before every `skill_manage` action that changes an existing skill, call the exact target `skill_view`: "
+        "use `skill_view(name)` for skill.md and `skill_view(name, file_path=...)` for an existing support file. "
+        "wait for the result, then mutate in a later tool step. candidate lists and transcripts are insufficient; "
+        "do not put the read and write in the same batch. if `_read_before_write_required` occurs, read first and "
+        "retry with the returned content."
+    ).lower()
+
+    assert expected_rule in prompt, "must spell out the complete read-before-write rule as a standalone paragraph"
+    assert prompt.index(expected_rule) < prompt.index("preference order"), (
+        "must place the reusable instruction before the preference-order heading"
+    )
 
 
 def test_combined_review_prompt_has_four_step_skill_ladder():

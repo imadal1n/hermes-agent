@@ -178,6 +178,14 @@ _MEMORY_REVIEW_PROMPT = (
     "If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
+_READ_BEFORE_WRITE_SKILL_PROMPT = (
+    "Before every `skill_manage` action that changes an existing skill, call the exact target `skill_view`: use "
+    "`skill_view(name)` for SKILL.md and `skill_view(name, file_path=...)` for an existing support file. Wait for "
+    "the result, then mutate in a later tool step. Candidate lists and transcripts are insufficient; do not put the "
+    "read and write in the same batch. If `_read_before_write_required` occurs, read first and retry with the returned "
+    "content.\n\n"
+)
+
 _SKILL_REVIEW_PROMPT = (
     "Review the conversation above and update the skill library. Be "
     "ACTIVE — most sessions produce at least one skill update, even if "
@@ -203,7 +211,8 @@ _SKILL_REVIEW_PROMPT = (
     "from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out "
     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do "
+    + _READ_BEFORE_WRITE_SKILL_PROMPT
+    + "Preference order — prefer the earliest action that fits, but do "
     "pick one when a signal above fired:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
     "conversation for skills the user loaded via /skill-name or you "
@@ -305,7 +314,8 @@ _COMBINED_REVIEW_PROMPT = (
     "emerged.\n"
     "  • A skill that was loaded or consulted turned out wrong, "
     "missing, or outdated — patch it now.\n\n"
-    "Preference order for skills — pick the earliest that fits:\n"
+    + _READ_BEFORE_WRITE_SKILL_PROMPT
+    + "Preference order for skills — pick the earliest that fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
     "loaded via /skill-name or skill_view in the conversation. If one "
     "of them covers the learning, PATCH it first. It was in play; "
