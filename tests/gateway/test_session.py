@@ -1,4 +1,5 @@
 """Tests for gateway session management."""
+import datetime as dt
 import json
 import pytest
 from pathlib import Path
@@ -1920,6 +1921,15 @@ class TestGatewayRoutingTable:
             user_id=user_id,
         )
 
+    def _matrix_dm_source(self):
+        return SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!test-room:example.invalid",
+            chat_name="consumer-a",
+            chat_type="dm",
+            user_id="@operator:example.invalid",
+        )
+
     def test_index_survives_restart_without_sessions_json(self, tmp_path):
         """Full SessionEntry state rehydrates from state.db alone."""
         config = GatewayConfig()
@@ -2016,4 +2026,89 @@ class TestGatewayRoutingTable:
             scope=restarted._routing_scope()
         )
         assert entry.session_key not in rows
+        restarted._db.close()
+
+    def test_finalized_sessions_are_not_recovered_from_routing(self, tmp_path):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!test-room:example.invalid",
+            chat_name="consumer-a",
+            chat_type="dm",
+            user_id="@operator:example.invalid",
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "user", "content": "before finalization"},
+        )
+        assert store._db is not None
+        store._db.set_expiry_finalized(entry.session_id, True)
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        fresh = restarted.get_or_create_session(source)
+
+        assert fresh.session_id != entry.session_id
+        assert restarted._db is not None
+        finalized = restarted._db.get_session(entry.session_id)
+        assert finalized is not None
+        assert finalized["expiry_finalized"] == 1
+        restarted._db.close()
+
+    def test_matrix_dm_db_recovery_ignores_previous_transcript_day(self, tmp_path):
+        config = GatewayConfig(write_sessions_json=False)
+        source = self._matrix_dm_source()
+        with patch("gateway.session._now", return_value=dt.datetime(2026, 7, 16, 6, 59, 0)):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+            entry = store.get_or_create_session(source)
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "user", "content": "before transcript boundary"},
+        )
+        assert store._db is not None
+        store._db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (dt.datetime(2026, 7, 16, 6, 59, 0).timestamp(), entry.session_id),
+        )
+        store._db._conn.execute("DELETE FROM gateway_routing")
+        store._db._conn.commit()
+        store._db.close()
+
+        with patch("gateway.session._now", return_value=dt.datetime(2026, 7, 16, 7, 0, 1)):
+            restarted = SessionStore(sessions_dir=tmp_path, config=config)
+            fresh = restarted.get_or_create_session(source)
+
+        assert fresh.session_id != entry.session_id
+        assert restarted._db is not None
+        old_row = restarted._db.get_session(entry.session_id)
+        assert old_row is not None
+        assert old_row["id"] == entry.session_id
+        restarted._db.close()
+
+    def test_matrix_dm_db_recovery_keeps_same_transcript_day(self, tmp_path):
+        config = GatewayConfig(write_sessions_json=False)
+        source = self._matrix_dm_source()
+        with patch("gateway.session._now", return_value=dt.datetime(2026, 7, 16, 7, 1, 0)):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+            entry = store.get_or_create_session(source)
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "user", "content": "same transcript day"},
+        )
+        assert store._db is not None
+        store._db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (dt.datetime(2026, 7, 16, 7, 1, 0).timestamp(), entry.session_id),
+        )
+        store._db._conn.execute("DELETE FROM gateway_routing")
+        store._db._conn.commit()
+        store._db.close()
+
+        with patch("gateway.session._now", return_value=dt.datetime(2026, 7, 16, 8, 0, 0)):
+            restarted = SessionStore(sessions_dir=tmp_path, config=config)
+            recovered = restarted.get_or_create_session(source)
+
+        assert recovered.session_id == entry.session_id
         restarted._db.close()

@@ -28,15 +28,22 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_entry(key: str, session_id: str, **kw) -> SessionEntry:
+def _make_entry(
+    key: str,
+    session_id: str,
+    *,
+    platform: Platform = Platform.TELEGRAM,
+    chat_type: str = "dm",
+    **kw,
+) -> SessionEntry:
     now = datetime.now()
     return SessionEntry(
         session_key=key,
         session_id=session_id,
         created_at=now - timedelta(hours=2),
         updated_at=now - timedelta(hours=1),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
+        platform=platform,
+        chat_type=chat_type,
         **kw,
     )
 
@@ -76,6 +83,15 @@ def _source() -> SessionSource:
     )
 
 
+def _matrix_dm_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.MATRIX,
+        chat_id="!room:example.invalid",
+        chat_type="dm",
+        user_id="@user:example.invalid",
+    )
+
+
 # ---------------------------------------------------------------------------
 # _is_session_ended_in_db helper
 # ---------------------------------------------------------------------------
@@ -83,6 +99,13 @@ def _source() -> SessionSource:
 class TestIsSessionEndedInDb:
     def test_ended_row_is_stale(self, tmp_path):
         db = _db_returning({"sid": {"end_reason": "agent_close", "id": "sid"}})
+        store = _make_store_with_db(tmp_path, db)
+        assert store._is_session_ended_in_db("sid") is True
+
+    def test_finalized_row_is_stale(self, tmp_path):
+        db = _db_returning({
+            "sid": {"end_reason": None, "expiry_finalized": 1, "id": "sid"},
+        })
         store = _make_store_with_db(tmp_path, db)
         assert store._is_session_ended_in_db("sid") is True
 
@@ -175,6 +198,52 @@ class TestRuntimeStaleGuard:
         assert result.session_id != "sid_stale"
         # A fresh session row was created for the new session_id.
         db.create_session.assert_called_once()
+        assert store._entries[key].session_id == result.session_id
+
+    def test_finalized_entry_creates_fresh_session(self, tmp_path):
+        source = _source()
+        db = _db_returning({
+            "sid_finalized": {
+                "end_reason": None,
+                "expiry_finalized": 1,
+                "id": "sid_finalized",
+            },
+        })
+        store = _make_store_with_db(tmp_path, db)
+        key = store._generate_session_key(source)
+        store._entries[key] = _make_entry(key, "sid_finalized")
+
+        result = store.get_or_create_session(source)
+
+        assert result.session_id != "sid_finalized"
+        db.create_session.assert_called_once()
+        db.reopen_session.assert_not_called()
+        assert store._entries[key].session_id == result.session_id
+
+    def test_matrix_dm_entry_before_0400_utc_boundary_creates_fresh_session(self, tmp_path):
+        source = _matrix_dm_source()
+        db = _db_returning({
+            "sid_old": {
+                "end_reason": None,
+                "expiry_finalized": 0,
+                "id": "sid_old",
+                "started_at": datetime(2026, 7, 16, 6, 59, 0).timestamp(),
+            },
+        })
+        store = _make_store_with_db(tmp_path, db)
+        key = store._generate_session_key(source)
+        store._entries[key] = _make_entry(
+            key,
+            "sid_old",
+            platform=Platform.MATRIX,
+        )
+
+        with patch("gateway.session._now", return_value=datetime(2026, 7, 16, 7, 0, 1)):
+            result = store.get_or_create_session(source)
+
+        assert result.session_id != "sid_old"
+        db.create_session.assert_called_once()
+        db.reopen_session.assert_not_called()
         assert store._entries[key].session_id == result.session_id
 
     def test_live_entry_returned_unchanged(self, tmp_path):

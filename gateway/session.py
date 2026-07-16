@@ -16,7 +16,7 @@ import json
 import threading
 import uuid
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
@@ -35,6 +35,19 @@ def _now() -> datetime:
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness`` into
 # ``HERMES_AUTO_CONTINUE_FRESHNESS`` at startup.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+TRANSCRIPT_DAY_START_UTC_HOUR = 4
+
+
+def _transcript_day_start_epoch(now: datetime) -> float:
+    now_utc = datetime.fromtimestamp(now.timestamp(), timezone.utc)
+    transcript_day = (now_utc - timedelta(hours=TRANSCRIPT_DAY_START_UTC_HOUR)).date()
+    return datetime(
+        transcript_day.year,
+        transcript_day.month,
+        transcript_day.day,
+        TRANSCRIPT_DAY_START_UTC_HOUR,
+        tzinfo=timezone.utc,
+    ).timestamp()
 
 
 def auto_continue_freshness_window() -> float:
@@ -1203,10 +1216,14 @@ class SessionStore:
         try:
             for key, entry in self._entries.items():
                 row = db.get_session(entry.session_id)
-                # row is None        -> not in DB (legacy / pre-SQLite) — keep
-                # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
-                if row is not None and row.get("end_reason") is not None:
+                # row is None       -> not in DB (legacy / pre-SQLite) — keep
+                # no boundary flags -> session alive — keep
+                # ended/finalized   -> session boundary — prune
+                if row is not None and self._is_session_routing_boundary_for_source(
+                    row,
+                    entry.origin,
+                    _now(),
+                ):
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -1461,6 +1478,7 @@ class SessionStore:
         if not callable(finder):
             return None
         try:
+            started_after = self._recovery_started_after(source, now)
             recovered = finder(
                 source=source.platform.value,
                 user_id=source.user_id,
@@ -1468,6 +1486,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                started_after=started_after,
             )
         except Exception as exc:
             logger.debug("Gateway session DB recovery failed for %s: %s", session_key, exc)
@@ -1710,14 +1729,19 @@ class SessionStore:
         except Exception:
             return False
 
-    def _is_session_ended_in_db(self, session_id: str) -> bool:
-        """Return True iff state.db has this session with a non-null end_reason.
+    def _is_session_ended_in_db(
+        self,
+        session_id: str,
+        source: Optional[SessionSource] = None,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Return True iff state.db says this session cannot be routed to.
 
         Mirrors the staleness test in ``_prune_stale_sessions_locked``:
           - no DB handle / no session_id -> False (can't tell — keep)
           - row absent (legacy / not yet persisted) -> False (keep)
-          - end_reason is None -> False (alive — keep)
-          - end_reason not None -> True (ended — stale)
+          - no end_reason and no expiry_finalized -> False (alive — keep)
+          - end_reason or expiry_finalized -> True (boundary — stale)
 
         Used by ``get_or_create_session`` to self-heal at routing time:
         ``_prune_stale_sessions_locked`` only runs at startup, so a session
@@ -1734,7 +1758,40 @@ class SessionStore:
             row = db.get_session(session_id)
         except Exception:
             return False
-        return bool(row is not None and row.get("end_reason") is not None)
+        return bool(
+            row is not None
+            and self._is_session_routing_boundary_for_source(row, source, now or _now())
+        )
+
+    @staticmethod
+    def _is_session_routing_boundary(row: Dict[str, Any]) -> bool:
+        return bool(row.get("end_reason") is not None or row.get("expiry_finalized"))
+
+    @classmethod
+    def _is_session_routing_boundary_for_source(
+        cls,
+        row: Dict[str, Any],
+        source: Optional[SessionSource],
+        now: datetime,
+    ) -> bool:
+        if cls._is_session_routing_boundary(row):
+            return True
+        started_after = cls._recovery_started_after(source, now)
+        if started_after is None:
+            return False
+        try:
+            started_at = float(row.get("started_at"))
+        except (TypeError, ValueError):
+            return False
+        return started_at < started_after
+
+    @staticmethod
+    def _recovery_started_after(source: Optional[SessionSource], now: datetime) -> Optional[float]:
+        if source is None:
+            return None
+        if source.platform != Platform.MATRIX or source.chat_type != "dm":
+            return None
+        return _transcript_day_start_epoch(now)
 
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """

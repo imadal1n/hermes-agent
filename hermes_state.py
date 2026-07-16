@@ -2300,6 +2300,7 @@ class SessionDB:
         chat_id: Optional[str] = None,
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
+        started_after: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Find the latest recoverable gateway session for a routing peer.
 
@@ -2314,20 +2315,24 @@ class SessionDB:
         """
         if not session_key:
             return None
+        lower_bound_sql = " AND started_at >= ?" if started_after is not None else ""
+        lower_bound_args = [started_after] if started_after is not None else []
         with self._lock:
             row = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND COALESCE(expiry_finalized, 0) = 0
+                  {lower_bound_sql}
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,
-                (session_key, source),
+                (session_key, source, *lower_bound_args),
             ).fetchone()
             if row is not None:
                 return dict(row)
@@ -2338,7 +2343,7 @@ class SessionDB:
             if chat_id is None or chat_type is None:
                 return None
             row = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM sessions
                 WHERE source = ?
                   AND COALESCE(user_id, '') = COALESCE(?, '')
@@ -2346,13 +2351,15 @@ class SessionDB:
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND COALESCE(expiry_finalized, 0) = 0
+                  {lower_bound_sql}
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,
-                (source, user_id, chat_id, chat_type, thread_id),
+                (source, user_id, chat_id, chat_type, thread_id, *lower_bound_args),
             ).fetchone()
         return dict(row) if row else None
 
