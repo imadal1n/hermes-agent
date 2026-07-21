@@ -563,6 +563,20 @@ class TestMemoryToolDispatcher:
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True
 
+    def test_omitted_action_with_content_defaults_to_add(self, store):
+        result = json.loads(memory_tool(target="memory", content="implicit add", store=store))
+
+        assert result["success"] is True
+        assert store.memory_entries == ["implicit add"]
+
+    def test_null_action_with_content_defaults_to_add(self, store):
+        result = json.loads(
+            memory_tool(action=None, target="memory", content="null action add", store=store)
+        )
+
+        assert result["success"] is True
+        assert store.memory_entries == ["null action add"]
+
     def test_replace_requires_old_text(self, store):
         # Missing old_text on a single-op replace is recoverable, not a dead-end:
         # return the current inventory + a retry instruction so the model can
@@ -684,6 +698,14 @@ class TestMemoryBatch:
         ))
         assert result["success"] is False
         assert "legit fact" not in store.memory_entries
+
+    def test_batch_rejects_non_object_operation(self, store):
+        result = json.loads(
+            memory_tool(target="memory", operations=["not an object"], store=store)
+        )
+
+        assert result["success"] is False
+        assert "operation 1 must be an object" in result["error"]
 
 
 # =========================================================================

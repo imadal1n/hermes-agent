@@ -996,10 +996,23 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # Some gateway/model tool calls serialize a simple add as {target, content}
+    # with action omitted/null. Treat only that unambiguous single-op shape as
+    # add; keep replace/remove strict.
+    if action in {None, ""} and content and not old_text and not operations:
+        action = "add"
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        for index, operation in enumerate(operations, start=1):
+            if not isinstance(operation, dict):
+                return tool_error(
+                    "Invalid memory batch: "
+                    f"operation {index} must be an object, got {type(operation).__name__}.",
+                    success=False,
+                )
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1156,7 +1169,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 
