@@ -156,6 +156,14 @@ class ContextEngine(ABC):
         """
         return False
 
+    def prune_request_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return a provider-request copy with optional cheap pruning applied."""
+        return messages
+
     # -- Optional: manual /compress preflight ------------------------------
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:

@@ -1808,6 +1808,27 @@ class ContextCompressor(ContextEngine):
 
         return result, pruned
 
+    def prune_request_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Prune old tool outputs on the API-request copy before full compaction."""
+        read_file_contents = {
+            idx: msg.get("content")
+            for idx, msg in enumerate(messages)
+            if msg.get("role") == "tool" and msg.get("name") == "read_file"
+        }
+        pruned_messages, _pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=None,
+        )
+        for idx, content in read_file_contents.items():
+            if idx < len(pruned_messages):
+                pruned_messages[idx]["content"] = content
+        return pruned_messages
+
     # ------------------------------------------------------------------
     # Summarization
     # ------------------------------------------------------------------

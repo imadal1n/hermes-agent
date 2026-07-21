@@ -142,6 +142,12 @@ class TestDefaults:
         engine = StubEngine()
         assert engine.should_compress_preflight([]) is False
 
+    def test_prune_request_messages_default_returns_same_messages(self):
+        engine = StubEngine()
+        messages = [{"role": "user", "content": "hello"}]
+
+        assert engine.prune_request_messages(messages, current_tokens=1000) is messages
+
 
 # ---------------------------------------------------------------------------
 # StubEngine behavior

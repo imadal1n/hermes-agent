@@ -1090,6 +1090,28 @@ def run_conversation(
         )
         total_chars = approx_tokens * 4
 
+        _compressor = agent.context_compressor
+        _threshold_tokens = int(getattr(_compressor, "threshold_tokens", 0) or 0)
+        _prune_request_messages = getattr(_compressor, "prune_request_messages", None)
+        if (
+            agent.compression_enabled
+            and len(messages) > 1
+            and callable(_prune_request_messages)
+            and _threshold_tokens > 0
+            and request_pressure_tokens >= int(_threshold_tokens * 0.80)
+        ):
+            _pruned_api_messages = _prune_request_messages(
+                api_messages,
+                current_tokens=request_pressure_tokens,
+            )
+            if _pruned_api_messages != api_messages:
+                api_messages = _pruned_api_messages
+                total_chars = sum(len(str(msg)) for msg in api_messages)
+                approx_tokens = estimate_messages_tokens_rough(api_messages)
+                request_pressure_tokens = estimate_request_tokens_rough(
+                    api_messages, tools=agent.tools or None
+                )
+
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
         )
@@ -1124,7 +1146,6 @@ def run_conversation(
         # room already reserved by _compute_threshold_tokens) and its summary-
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
-        _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )

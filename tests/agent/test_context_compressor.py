@@ -2887,6 +2887,27 @@ class TestTokenBudgetTailProtection:
         # At least one old tool result should have been pruned
         assert pruned >= 1
 
+    def test_prune_request_messages_preserves_read_file_content(self, budget_compressor):
+        c = budget_compressor
+        c.protect_last_n = 1
+        read_content = "exact file bytes" * 500
+        terminal_content = "terminal output" * 500
+        messages = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "read-1", "function": {"name": "read_file", "arguments": '{"path": "config.py"}'}}]},
+            {"role": "tool", "name": "read_file", "content": read_content, "tool_call_id": "read-1"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "term-1", "function": {"name": "terminal", "arguments": '{"command": "pytest"}'}}]},
+            {"role": "tool", "name": "terminal", "content": terminal_content, "tool_call_id": "term-1"},
+            {"role": "user", "content": "recent"},
+        ]
+
+        result = c.prune_request_messages(messages, current_tokens=100_000)
+
+        assert result[1]["content"] == read_content
+        assert result[3]["content"] != terminal_content
+        assert result[3]["content"].startswith("[terminal] ran `pytest`")
+
     def test_prune_short_conv_protects_entire_tail(self, budget_compressor):
         """Regression guard for PR #17025.
 
