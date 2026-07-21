@@ -1529,6 +1529,7 @@ class SessionStore:
         if not callable(finder):
             return None
         try:
+            started_after = self._recovery_started_after(source, now)
             recovered = finder(
                 source=source.platform.value,
                 user_id=source.user_id,
@@ -1536,6 +1537,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                started_after=started_after,
             )
         except Exception as exc:
             logger.debug("Gateway session DB recovery failed for %s: %s",
@@ -1999,7 +2001,7 @@ class SessionStore:
         _is_stale = False
         _reset_reason = None
         if _entry_for_checks is not None and _stale_session_id is not None:
-            _is_stale = self._is_session_ended_in_db(_stale_session_id)
+            _is_stale = self._is_session_ended_in_db(_stale_session_id, source, now)
             if _entry_for_checks.suspended:
                 _reset_reason = "suspended"
             elif _entry_for_checks.resume_pending:
