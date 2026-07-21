@@ -49,6 +49,7 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+    sanitize_provider_request_payload,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1345,6 +1346,11 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                api_kwargs = sanitize_provider_request_payload(api_kwargs)
+                _original_api_kwargs = sanitize_provider_request_payload(
+                    _original_api_kwargs
+                )
 
                 try:
                     from hermes_cli.plugins import (

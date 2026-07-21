@@ -17,7 +17,17 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Final, TypeAlias
+
+ProviderRequestPayload: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | list["ProviderRequestPayload"]
+    | dict[str, "ProviderRequestPayload"]
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +36,8 @@ logger = logging.getLogger(__name__)
 # below as well as by run_agent and the CLI for paste-from-clipboard
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+_ZAI_FALSE_OVERLOAD_TRIGGER: Final = "Hermes Agent"
+_ZAI_FALSE_OVERLOAD_REPLACEMENT: Final = "Hermes runtime"
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -37,6 +49,47 @@ def _sanitize_surrogates(text: str) -> str:
     if _SURROGATE_RE.search(text):
         return _SURROGATE_RE.sub('\ufffd', text)
     return text
+
+
+def sanitize_provider_request_payload(
+    payload: ProviderRequestPayload,
+) -> ProviderRequestPayload:
+    if isinstance(payload, str):
+        return payload.replace(
+            _ZAI_FALSE_OVERLOAD_TRIGGER,
+            _ZAI_FALSE_OVERLOAD_REPLACEMENT,
+        )
+    if isinstance(payload, list):
+        changed = False
+        sanitized_items: list[ProviderRequestPayload] = []
+        for item in payload:
+            content = item.get("content") if isinstance(item, dict) else None
+            if (
+                isinstance(item, dict)
+                and item.get("role") == "user"
+                and isinstance(content, str)
+                and not content.strip()
+            ):
+                changed = True
+                continue
+            sanitized_item = sanitize_provider_request_payload(item)
+            if sanitized_item is not item:
+                changed = True
+            sanitized_items.append(sanitized_item)
+        if changed:
+            return sanitized_items
+        return payload
+    if isinstance(payload, dict):
+        changed = False
+        sanitized_payload: dict[str, ProviderRequestPayload] = {}
+        for key, value in payload.items():
+            sanitized_value = sanitize_provider_request_payload(value)
+            if sanitized_value is not value:
+                changed = True
+            sanitized_payload[key] = sanitized_value
+        if changed:
+            return sanitized_payload
+    return payload
 
 
 def _sanitize_structure_surrogates(payload: Any) -> bool:
@@ -464,6 +517,7 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
+    "sanitize_provider_request_payload",
     "_sanitize_surrogates",
     "_sanitize_structure_surrogates",
     "_sanitize_messages_surrogates",

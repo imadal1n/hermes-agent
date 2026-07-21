@@ -37,6 +37,7 @@ from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
+    sanitize_provider_request_payload,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -385,6 +386,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    api_kwargs = sanitize_provider_request_payload(api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
