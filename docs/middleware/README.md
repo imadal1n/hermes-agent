@@ -45,6 +45,7 @@ Supported middleware kinds:
 | Kind | Payload | Return shape | Purpose |
 | --- | --- | --- | --- |
 | `llm_request` | `request`, `original_request` | `{"request": {...}}` | Replace effective provider kwargs before provider execution. |
+| `structured_context_prune` | `contributions`, pressure metadata | Effective messages/tools/system prompt plus redacted accounting, or `None` | Shape a temporary request view before Hermes compression gates. |
 | `tool_request` | `tool_name`, `args`, `original_args` | `{"args": {...}}` | Replace effective tool args before hooks, guardrails, approvals, and execution. |
 | `llm_execution` | `request`, `original_request`, `next_call` | Any provider response | Wrap or replace the actual provider call. |
 | `tool_execution` | `tool_name`, `args`, `original_args`, `next_call` | Any tool result | Wrap or replace the actual tool call. |
@@ -78,15 +79,46 @@ runtime path.
 
 ## Execution Order
 
+### Structured Context Pruning
+
+`structured_context_prune` runs earlier than `llm_request`. It is the hook for
+plugins that need to reduce the effective prompt before Hermes decides whether
+to run generic context compression.
+
+Hermes invokes it at two pressure gates:
+
+1. **Preflight**, after loading the turn context and before the preflight token
+   estimate is passed to the context-compression gate.
+2. **Pre-API**, after Hermes builds the provider-call message/tool copy and
+   before the request-pressure estimate is passed to the second compression
+   gate and before provider kwargs are built.
+
+The hook receives structured contributions, phase metadata, compression
+thresholds, context-length facts, current pressure estimates, and recent-window
+settings. A plugin may return an effective view for the current call: messages,
+system prompt, tools, and redacted accounting. Hermes uses that same effective
+view for pressure estimation and provider dispatch. The canonical conversation
+history, session rows, memory, and cached system prompt remain unchanged unless
+a separate feature explicitly edits them.
+
+`llm_request` middleware still runs later on the provider kwargs. It is useful
+for final request shaping or fallback compatibility, but it is too late to
+prevent either Hermes compression gate from firing because those decisions have
+already been made.
+
 ### LLM Calls
 
 For each provider request, Hermes applies middleware in this order:
 
-1. Build provider kwargs from the current conversation.
-2. Apply `llm_request` middleware.
-3. Emit `pre_api_request` observer hooks with the effective request.
-4. Run provider execution through `llm_execution` middleware.
-5. Emit `post_api_request` or `api_request_error` observer hooks.
+1. Build the per-call context and optionally apply `structured_context_prune`
+   before the preflight compression gate.
+2. Build the provider-call message/tool copy and optionally apply
+   `structured_context_prune` before the pre-API compression gate.
+3. Build provider kwargs from the effective current-call view.
+4. Apply `llm_request` middleware.
+5. Emit `pre_api_request` observer hooks with the effective request.
+6. Run provider execution through `llm_execution` middleware.
+7. Emit `post_api_request` or `api_request_error` observer hooks.
 
 Request middleware sees the full provider kwargs, including `messages` or
 Responses API `input`, model settings, tool definitions, stream options, and
@@ -258,3 +290,6 @@ For NeMo Relay adaptive execution middleware, see
   approvals evaluate.
 - Observer hooks remain the right place for read-only telemetry. Use middleware
   only when a plugin needs to alter or wrap behavior.
+- Structured context pruning must be fail-open and redacted. Accounting should
+  contain aggregate counts/classes only, not raw prompt text, raw paths, session
+  identifiers, or secret material.
