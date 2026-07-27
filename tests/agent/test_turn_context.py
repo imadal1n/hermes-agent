@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import pathlib
+import sys
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,33 @@ from agent.context_compressor import ContextCompressor
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
+
+
+def _load_tokenjuice_register():
+    try:
+        from tokenjuice_hermes.plugin import register
+
+        return register
+    except ModuleNotFoundError:
+        sibling = pathlib.Path(__file__).resolve().parents[3] / "tokenjuice-hermes"
+        if sibling.exists():
+            sys.path.insert(0, str(sibling))
+            from tokenjuice_hermes.plugin import register
+
+            return register
+        pytest.skip("tokenjuice-hermes checkout or package is required for cross-repo tests")
+
+
+class _TokenJuiceHost:
+    def __init__(self, config):
+        self.config = config
+        self.callbacks = {}
+
+    def register_hook(self, name, callback):
+        self.callbacks[name] = callback
+
+    def register_middleware(self, _name, _callback):
+        pass
 
 
 class _FakeTodoStore:
@@ -672,6 +700,8 @@ class TestStructuredContributionModel:
             "atomic_group_id",
             "prune_policy",
             "protected_reason",
+            "content",
+            "provider_message",
         }
         for contribution in contributions:
             missing = required - contribution.keys()
@@ -679,6 +709,21 @@ class TestStructuredContributionModel:
             assert contribution["kind"] == "message"
             assert contribution["provenance"] == "conversation_history"
             assert contribution["class"] in {"user_message", "assistant_message"}
+            assert contribution["provider_message"] in messages
+
+    def test_structured_contribution_preserves_multimodal_provider_message(self):
+        from agent.context_pruning import build_message_contributions
+
+        content = [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        messages = [{"role": "user", "content": content, "metadata": {"kept": True}}]
+
+        contributions = build_message_contributions(messages, phase="pre_api")
+
+        assert contributions[0]["content"] != str(content)
+        assert contributions[0]["provider_message"] == messages[0]
 
     def test_structured_contribution_tool_interaction_atomic_group(self):
         from agent.context_pruning import build_message_contributions
@@ -715,6 +760,32 @@ class TestStructuredContributionModel:
             == contributions[result_idx]["atomic_group_id"]
         )
         assert contributions[result_idx]["atomic_group_id"] == "call-terminal-1"
+
+    def test_structured_contribution_multi_tool_batch_is_one_atomic_group(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [
+            {"role": "user", "content": "run both"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call-a", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+                    {"id": "call-b", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "name": "terminal", "content": "a"},
+            {"role": "tool", "tool_call_id": "call-b", "name": "terminal", "content": "b"},
+        ]
+
+        contributions = build_message_contributions(messages, phase="pre_api")
+
+        grouped = [
+            contribution["atomic_group_id"]
+            for contribution in contributions
+            if contribution["class"] in {"assistant_message", "terminal_tool_output"}
+        ]
+        assert grouped == ["tool-batch:call-a,call-b"] * 3
 
     def test_structured_contribution_orphan_tool_results_protected(self):
         from agent.context_pruning import build_message_contributions
@@ -763,6 +834,46 @@ class TestStructuredContributionModel:
             assert contribution["atomic_group_id"] is not None
             assert isinstance(contribution["content_hash"], str)
             assert len(contribution["content_hash"]) == 64
+            assert contribution["provider_tool"] in tools
+
+    def test_structured_prune_hook_kwargs_leave_tokenjuice_target_ratios_authoritative(self):
+        from types import SimpleNamespace
+
+        from agent.context_pruning import apply_structured_context_prune
+
+        cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+        seen = {}
+
+        def _hook(_contributions, **kwargs):
+            seen.update(kwargs)
+            return {"effective_messages": [{"role": "user", "content": "kept"}]}
+
+        agent = SimpleNamespace(
+            _structured_pruning_config=cfg,
+            _structured_context_prune=_hook,
+            context_compressor=SimpleNamespace(context_length=100_000),
+            compression_enabled=True,
+            session_id="session-a",
+            model="model-a",
+            provider="provider-a",
+            api_mode="chat_completions",
+        )
+
+        result = apply_structured_context_prune(
+            agent,
+            phase="pre_api",
+            messages=[{"role": "user", "content": "hello"}],
+            system_prompt="SYSTEM",
+            tools=None,
+        )
+
+        assert result is not None
+        assert "target_tokens" not in seen
+        assert seen["trigger_tokens"] == int(
+            cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+            * cfg["tokenjuice_prompt_pruning_trigger_ratio"]
+            / 100
+        )
 
     def test_structured_contribution_recent_messages_protected(self):
         from agent.context_pruning import build_message_contributions
@@ -818,3 +929,130 @@ class TestStructuredContributionModel:
         assert contribution.get("created_at_epoch_ms") is not None
         assert isinstance(contribution["created_at_epoch_ms"], int)
 
+
+class TestStructuredPruningTokenJuiceIntegration:
+    def test_actual_hook_disabled_is_noop(self):
+        from agent.context_pruning import apply_structured_context_prune
+
+        cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+        cfg["tokenjuice_prompt_pruning_enabled"] = False
+        host = _TokenJuiceHost(cfg)
+        _load_tokenjuice_register()(host)
+
+        agent = types.SimpleNamespace(
+            _structured_pruning_config=cfg,
+            _structured_context_prune=host.callbacks.get("structured_context_prune"),
+            context_compressor=types.SimpleNamespace(context_length=100_000),
+            compression_enabled=True,
+            session_id="session-a",
+            model="model-a",
+            provider="provider-a",
+            api_mode="chat_completions",
+            tools=None,
+        )
+
+        result = apply_structured_context_prune(
+            agent,
+            phase="pre_api",
+            messages=[{"role": "user", "content": "hello"}],
+            system_prompt="SYSTEM",
+            tools=None,
+        )
+
+        assert result is None
+
+    def test_actual_hook_preserves_shape_system_once_and_multicall_atomicity(self):
+        from agent.context_pruning import apply_structured_context_prune
+
+        cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+        cfg["tokenjuice_prompt_pruning_threshold_tokens"] = 400
+        cfg["tokenjuice_prompt_pruning_trigger_ratio"] = 50
+        cfg["tokenjuice_prompt_pruning_soft_target_ratio"] = 40
+        cfg["tokenjuice_prompt_pruning_hard_target_ratio"] = 40
+        cfg["tokenjuice_prompt_pruning_min_saved_tokens"] = 1
+        cfg["tokenjuice_prompt_pruning_cache_ttl_seconds"] = 0
+        cfg["tokenjuice_prompt_pruning_protect_recent_messages"] = 0
+        cfg["tokenjuice_prompt_pruning_protect_recent_tool_interactions"] = 0
+        host = _TokenJuiceHost(cfg)
+        _load_tokenjuice_register()(host)
+
+        multimodal_content = [
+            {"type": "text", "text": "inspect image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": multimodal_content, "metadata": {"kept": True}},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call-a", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+                    {"id": "call-b", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "name": "terminal", "content": "a" * 1200},
+            {"role": "tool", "tool_call_id": "call-b", "name": "terminal", "content": "b" * 1200},
+        ]
+        agent = types.SimpleNamespace(
+            _structured_pruning_config=cfg,
+            _structured_context_prune=host.callbacks["structured_context_prune"],
+            context_compressor=types.SimpleNamespace(context_length=100_000),
+            compression_enabled=True,
+            session_id="session-a",
+            model="model-a",
+            provider="provider-a",
+            api_mode="chat_completions",
+            tools=None,
+        )
+
+        result = apply_structured_context_prune(
+            agent,
+            phase="pre_api",
+            messages=messages,
+            system_prompt="SYSTEM",
+            tools=None,
+        )
+
+        assert result is not None
+        assert result["effective_messages"] == messages[:2]
+        assert result["effective_system_prompt"] == ""
+
+    def test_actual_hook_ttl_protects_real_turn_ephemeral_terminal_candidate(self):
+        from agent.context_pruning import build_message_contributions
+
+        cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+        cfg["tokenjuice_prompt_pruning_threshold_tokens"] = 400
+        cfg["tokenjuice_prompt_pruning_trigger_ratio"] = 50
+        cfg["tokenjuice_prompt_pruning_min_saved_tokens"] = 1
+        cfg["tokenjuice_prompt_pruning_protect_recent_messages"] = 0
+        cfg["tokenjuice_prompt_pruning_protect_recent_tool_interactions"] = 0
+        host = _TokenJuiceHost(cfg)
+        _load_tokenjuice_register()(host)
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call-a", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "name": "terminal", "content": "a" * 1200},
+        ]
+
+        contributions = build_message_contributions(
+            messages,
+            phase="pre_api",
+            deterministic_now_epoch_ms=10_000_000,
+        )
+        result = host.callbacks["structured_context_prune"](
+            contributions,
+            phase="pre_api",
+            threshold_tokens=cfg["tokenjuice_prompt_pruning_threshold_tokens"],
+            trigger_tokens=200,
+            now_epoch_ms=10_000_000,
+        )
+
+        assert result is not None
+        assert result["accounting"]["pruned_count"] == 0
+        assert result["effective_messages"] == messages

@@ -11,10 +11,11 @@ seam fails open and returns the unpruned view unchanged.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeGuard
 
 from agent.model_metadata import estimate_messages_tokens_rough
 from agent.system_prompt import build_system_prompt_parts
@@ -80,6 +81,8 @@ def _new_contribution(
     protected_reason: str,
     created_at_epoch_ms: Optional[int] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
+    provider_message: Optional[Dict[str, Any]] = None,
+    provider_tool: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a single structured contribution record with the required metadata.
 
@@ -94,6 +97,7 @@ def _new_contribution(
         "class": class_,
         "stability": stability,
         "content_hash": _sha256_hex(content),
+        "content": content,
         "cache_scope": cache_scope,
         "token_estimate": token_estimate,
         "char_count": len(content),
@@ -105,6 +109,10 @@ def _new_contribution(
         contribution["created_at_epoch_ms"] = created_at_epoch_ms
     if tool_calls is not None:
         contribution["tool_calls"] = tool_calls
+    if provider_message is not None:
+        contribution["provider_message"] = provider_message
+    if provider_tool is not None:
+        contribution["provider_tool"] = provider_tool
     return contribution
 
 
@@ -198,9 +206,9 @@ def _atomic_group_id_for_message(
     """Return the tool_call_id for messages that belong to a tool interaction.
 
     Assistant messages that carry tool_calls are grouped with their matching tool
-    result messages by sharing the same atomic_group_id.  An assistant message
-    with multiple tool_calls gets its own group id derived from the first call id
-    so it can be kept together with the corresponding results.
+    result messages by sharing the same atomic_group_id.  Multiple tool calls in
+    one assistant message form one batch group so pruning cannot orphan one call
+    or one result from the same provider turn.
     """
     if not isinstance(msg, dict):
         return None
@@ -208,15 +216,36 @@ def _atomic_group_id_for_message(
     if role == "assistant":
         tcs = msg.get("tool_calls") or []
         if tcs and isinstance(tcs, list):
-            first = tcs[0]
-            if isinstance(first, dict):
-                tc_id = first.get("id")
+            ids = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
                 if isinstance(tc_id, str) and tc_id:
-                    return tc_id
+                    ids.append(tc_id)
+            if len(ids) == 1:
+                return ids[0]
+            if len(ids) > 1:
+                return "tool-batch:" + ",".join(ids)
         return None
     if role == "tool":
         tool_call_id = msg.get("tool_call_id")
         if isinstance(tool_call_id, str) and tool_call_id and _tool_name_for_message(messages, tool_call_id) is not None:
+            for candidate in messages:
+                if not isinstance(candidate, dict) or candidate.get("role") != "assistant":
+                    continue
+                tcs = candidate.get("tool_calls") or []
+                if not isinstance(tcs, list):
+                    continue
+                ids = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    if isinstance(tc_id, str) and tc_id:
+                        ids.append(tc_id)
+                if tool_call_id in ids and len(ids) > 1:
+                    return "tool-batch:" + ",".join(ids)
             return tool_call_id
         return None
     return None
@@ -286,6 +315,7 @@ def build_message_contributions(
                 protected_reason=protected_reason,
                 created_at_epoch_ms=now - (idx * 1000),
                 tool_calls=_tool_calls,
+                provider_message=copy.deepcopy(msg),
             )
         )
     return contributions
@@ -324,6 +354,7 @@ def build_tool_schema_contributions(
                 atomic_group_id=f"tool-schema-{idx}",
                 prune_policy="never",
                 protected_reason="protected: tool schema shape must be preserved",
+                provider_tool=copy.deepcopy(tool),
             )
         )
     return contributions
@@ -387,7 +418,7 @@ def build_system_prompt_contributions(
     return contributions
 
 
-def _is_valid_pruning_config(config: Any) -> bool:
+def _is_valid_pruning_config(config: Any) -> TypeGuard[Dict[str, Any]]:
     """Fail-open validation: accept only a well-formed pruning configuration dict."""
     if not isinstance(config, dict):
         return False
@@ -421,12 +452,15 @@ def _build_structured_contributions(
     config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """Assemble all contributions for a structured pruning call."""
-    system_contributions = build_system_prompt_contributions(
-        agent,
-        system_message=system_prompt,
-        structured_pruning_enabled=True,
-        test_config=config,
-    )
+    has_provider_system_message = bool(messages and messages[0].get("role") == "system")
+    system_contributions = []
+    if not has_provider_system_message:
+        system_contributions = build_system_prompt_contributions(
+            agent,
+            system_message=system_prompt,
+            structured_pruning_enabled=True,
+            test_config=config,
+        )
     message_contributions = build_message_contributions(
         messages,
         phase=phase,
@@ -509,9 +543,7 @@ def apply_structured_context_prune(
     threshold_tokens = int(config.get("tokenjuice_prompt_pruning_threshold_tokens", 0))
     context_length = int(getattr(compressor, "context_length", 0) or 0)
     trigger_ratio = float(config["tokenjuice_prompt_pruning_trigger_ratio"]) / 100.0
-    target_ratio = float(config["tokenjuice_prompt_pruning_target_ratio"]) / 100.0
     trigger_tokens = int(threshold_tokens * trigger_ratio)
-    target_tokens = int(threshold_tokens * target_ratio)
 
     tool_schema_tokens = 0
     if tools:
@@ -543,7 +575,6 @@ def apply_structured_context_prune(
             context_length=context_length,
             threshold_tokens=threshold_tokens,
             trigger_tokens=trigger_tokens,
-            target_tokens=target_tokens,
             tool_schema_tokens=tool_schema_tokens,
             now_epoch_ms=int(time.time() * 1000),
         )
