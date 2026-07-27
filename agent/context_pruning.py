@@ -17,7 +17,6 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, TypeGuard
 
-from agent.model_metadata import estimate_messages_tokens_rough
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -29,8 +28,6 @@ _REQUIRED_PRUNING_CONFIG_KEYS: frozenset[str] = frozenset({
     "tokenjuice_prompt_pruning_threshold_tokens",
     "tokenjuice_prompt_pruning_trigger_ratio",
     "tokenjuice_prompt_pruning_target_ratio",
-    "tokenjuice_prompt_pruning_soft_target_ratio",
-    "tokenjuice_prompt_pruning_hard_target_ratio",
     "tokenjuice_prompt_pruning_min_saved_tokens",
     "tokenjuice_prompt_pruning_cache_ttl_seconds",
     "tokenjuice_prompt_pruning_protect_recent_messages",
@@ -430,8 +427,10 @@ def _is_valid_pruning_config(config: Any) -> TypeGuard[Dict[str, Any]]:
     try:
         float(config["tokenjuice_prompt_pruning_trigger_ratio"])
         float(config["tokenjuice_prompt_pruning_target_ratio"])
-        float(config["tokenjuice_prompt_pruning_soft_target_ratio"])
-        float(config["tokenjuice_prompt_pruning_hard_target_ratio"])
+        if "tokenjuice_prompt_pruning_soft_target_ratio" in config:
+            float(config["tokenjuice_prompt_pruning_soft_target_ratio"])
+        if "tokenjuice_prompt_pruning_hard_target_ratio" in config:
+            float(config["tokenjuice_prompt_pruning_hard_target_ratio"])
         int(config["tokenjuice_prompt_pruning_threshold_tokens"])
         int(config["tokenjuice_prompt_pruning_min_saved_tokens"])
         int(config["tokenjuice_prompt_pruning_cache_ttl_seconds"])

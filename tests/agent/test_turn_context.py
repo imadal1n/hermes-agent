@@ -1018,6 +1018,63 @@ class TestStructuredPruningTokenJuiceIntegration:
         assert result["effective_messages"] == messages[:2]
         assert result["effective_system_prompt"] == ""
 
+    def test_actual_hook_uses_target_ratio_when_phase_targets_are_omitted(self):
+        from agent.context_pruning import apply_structured_context_prune
+
+        cfg = {
+            key: value
+            for key, value in _STRUCTURED_PRUNING_TEST_CONFIG.items()
+            if key
+            not in {
+                "tokenjuice_prompt_pruning_soft_target_ratio",
+                "tokenjuice_prompt_pruning_hard_target_ratio",
+            }
+        }
+        cfg["tokenjuice_prompt_pruning_threshold_tokens"] = 400
+        cfg["tokenjuice_prompt_pruning_trigger_ratio"] = 50
+        cfg["tokenjuice_prompt_pruning_target_ratio"] = 90
+        cfg["tokenjuice_prompt_pruning_min_saved_tokens"] = 1
+        cfg["tokenjuice_prompt_pruning_cache_ttl_seconds"] = 0
+        cfg["tokenjuice_prompt_pruning_protect_recent_messages"] = 0
+        cfg["tokenjuice_prompt_pruning_protect_recent_tool_interactions"] = 0
+        host = _TokenJuiceHost(cfg)
+        _load_tokenjuice_register()(host)
+
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "u" * 1400},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call-a", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "name": "terminal", "content": "a" * 480},
+        ]
+        agent = types.SimpleNamespace(
+            _structured_pruning_config=cfg,
+            _structured_context_prune=host.callbacks["structured_context_prune"],
+            context_compressor=types.SimpleNamespace(context_length=100_000),
+            compression_enabled=True,
+            session_id="session-a",
+            model="model-a",
+            provider="provider-a",
+            api_mode="chat_completions",
+            tools=None,
+        )
+
+        result = apply_structured_context_prune(
+            agent,
+            phase="pre_api",
+            messages=messages,
+            system_prompt="SYSTEM",
+            tools=None,
+        )
+
+        assert result is not None
+        assert result["effective_messages"] == messages[:2]
+
     def test_actual_hook_ttl_protects_real_turn_ephemeral_terminal_candidate(self):
         from agent.context_pruning import build_message_contributions
 
