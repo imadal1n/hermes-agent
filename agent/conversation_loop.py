@@ -32,6 +32,7 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.context_pruning import apply_structured_context_prune
 from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
@@ -1085,9 +1086,38 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        #
+        # Structured context-pruning seam: if a policy hook is registered, it
+        # may return an effective message/tool view for this API call.  The
+        # same effective view drives the pressure estimate, the existing
+        # request-pruning fallback, the compression gate, and provider dispatch.
+        # Fail open: keep the canonical api_messages/tools unchanged when no
+        # hook, disabled config, malformed response, or exception occurs.
+        _effective_messages = api_messages
+        _effective_tools = agent.tools
+        _original_tools = agent.tools
+        if agent.compression_enabled and len(messages) > 1:
+            _pruned_view = apply_structured_context_prune(
+                agent,
+                phase="pre_api",
+                messages=api_messages,
+                system_prompt=active_system_prompt,
+                tools=agent.tools or None,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+            )
+            if _pruned_view is not None:
+                _maybe_messages = _pruned_view.get("effective_messages", api_messages)
+                if isinstance(_maybe_messages, list):
+                    _effective_messages = _maybe_messages
+                    api_messages = _effective_messages
+                _maybe_tools = _pruned_view.get("effective_tools")
+                if isinstance(_maybe_tools, list):
+                    _effective_tools = _maybe_tools
+
+        approx_tokens = estimate_messages_tokens_rough(_effective_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(_effective_tools) if _effective_tools is not None else 0
         )
         total_chars = approx_tokens * 4
 
@@ -1110,7 +1140,7 @@ def run_conversation(
                 total_chars = sum(len(str(msg)) for msg in api_messages)
                 approx_tokens = estimate_messages_tokens_rough(api_messages)
                 request_pressure_tokens = estimate_request_tokens_rough(
-                    api_messages, tools=agent.tools or None
+                    api_messages, tools=_effective_tools or None
                 )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -1307,7 +1337,19 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                # The structured-pruning seam determined the effective tools for
+                # this API call; apply them only while building the provider
+                # payload so the canonical agent.tools registry is not mutated.
+                agent.tools = _effective_tools
+                try:
+                    api_kwargs = agent._build_api_kwargs(api_messages)
+                finally:
+                    agent.tools = _original_tools
+                # The provider payload may omit an empty ``tools`` list (legacy
+                # behaviour), but the seam's effective view must be observable
+                # downstream and in tests even when pruned to zero tools.
+                if _effective_tools is not None and "tools" not in api_kwargs:
+                    api_kwargs["tools"] = list(_effective_tools)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1398,7 +1440,7 @@ def run_conversation(
                             if isinstance(request_messages, list)
                             else [],
                             message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
+                            tool_count=len(_effective_tools or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,

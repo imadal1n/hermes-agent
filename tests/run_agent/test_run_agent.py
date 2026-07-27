@@ -20,6 +20,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
+from agent.context_compressor import ContextCompressor
+from agent.model_metadata import (
+    _estimate_tools_tokens_rough as _orig_estimate_tools_tokens_rough,
+    estimate_messages_tokens_rough as _orig_estimate_messages_tokens_rough,
+)
+import agent.conversation_loop
 
 import run_agent
 from run_agent import AIAgent
@@ -5927,6 +5933,348 @@ class TestRunConversation:
         assert second_call["max_tokens"] <= 65471  # 65535 - 64
         assert agent.context_compressor.context_length == 131_072
         mock_compress.assert_not_called()
+
+
+_STRUCTURED_PRUNING_TEST_CONFIG: dict[str, bool | int | str] = {
+    "tokenjuice_prompt_pruning_enabled": True,
+    "tokenjuice_prompt_pruning_threshold_tokens": 8500,
+    "tokenjuice_prompt_pruning_trigger_ratio": 80,
+    "tokenjuice_prompt_pruning_target_ratio": 75,
+    "tokenjuice_prompt_pruning_soft_target_ratio": 75,
+    "tokenjuice_prompt_pruning_hard_target_ratio": 65,
+    "tokenjuice_prompt_pruning_min_saved_tokens": 256,
+    "tokenjuice_prompt_pruning_cache_ttl_seconds": 3600,
+    "tokenjuice_prompt_pruning_protect_recent_messages": 8,
+    "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 2,
+    "tokenjuice_prompt_pruning_classes": "terminal_tool_output",
+    "tokenjuice_prompt_pruning_accounting_enabled": True,
+}
+
+
+def _make_compressor_for_pre_api_pruning_test(
+    cfg: dict[str, bool | int | str],
+) -> MagicMock:
+    """Build a mocked compressor that triggers the pre-API compression gate."""
+    threshold = cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+    trigger_ratio = cfg["tokenjuice_prompt_pruning_trigger_ratio"] / 100
+    compressor = MagicMock(spec=ContextCompressor)
+    compressor.context_length = int(threshold / trigger_ratio)
+    compressor.threshold_tokens = threshold
+    compressor.threshold_percent = trigger_ratio
+    compressor.protect_first_n = 2
+    compressor.protect_last_n = 2
+    compressor.last_prompt_tokens = 1
+    compressor.should_compress = lambda tokens: tokens >= threshold
+    compressor.should_defer_preflight_to_real_usage = lambda _tokens: False
+    compressor.get_active_compression_failure_cooldown = lambda: None
+    compressor.prune_request_messages = None
+    return compressor
+
+
+def _make_inject_huge_tool_result(tool_result_content: str):
+    """Bypass real tool execution and append a huge tool result to messages."""
+
+    def _inject(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tc in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result_content,
+                }
+            )
+
+    return _inject
+
+
+def _make_large_tools(threshold_tokens: int) -> list:
+    """Return a tool registry whose rough token estimate alone exceeds threshold."""
+    description_chars = (threshold_tokens * 4) + 1024
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "x" * description_chars,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+    ]
+
+
+def _setup_pre_api_pruning_agent(
+    agent,
+    cfg: dict[str, bool | int | str] | None,
+):
+    """Configure an agent so only the pre-API gate sees over-threshold pressure."""
+    base_cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    threshold = (cfg or base_cfg)["tokenjuice_prompt_pruning_threshold_tokens"]
+    agent._cached_system_prompt = "SYSTEM"
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = True
+    agent.save_trajectories = False
+    agent.tools = _make_large_tools(threshold)
+    agent.valid_tool_names = {"web_search"}
+    agent.context_compressor = _make_compressor_for_pre_api_pruning_test(
+        cfg or base_cfg
+    )
+    if cfg is not None:
+        agent._structured_pruning_config = cfg
+
+
+
+def _make_pre_api_pruning_stub(pruned_api_messages, effective_tools, accounting):
+    """Return a stub matching the future structured-pruning seam contract."""
+    _required_contribution_keys = {"id", "kind", "class", "token_estimate"}
+
+    def _prune_stub(contributions, **kwargs):
+        assert isinstance(contributions, list) and contributions, (
+            "structured seam must pass a non-empty contributions list"
+        )
+        for c in contributions:
+            assert isinstance(c, dict), (
+                f"structured seam contribution must be a dict, got {type(c)}"
+            )
+            missing = _required_contribution_keys - c.keys()
+            assert not missing, (
+                f"structured seam contribution missing required keys: {missing}"
+            )
+        return {
+            "effective_messages": pruned_api_messages,
+            "effective_system_prompt": (
+                pruned_api_messages[0].get("content", "")
+                if pruned_api_messages
+                else ""
+            ),
+            "effective_tools": effective_tools,
+            "accounting": accounting,
+        }
+
+    return _prune_stub
+
+
+
+def test_structured_pruning_pre_api_pressure_lowers_and_skips_compression(agent):
+    """Given a tool result and a large tool registry that push pre-API pressure
+    over threshold, a structured pruning hook must be invoked before
+    ``approx_tokens`` and ``request_pressure_tokens`` are consumed by the
+    compression gate. The returned effective messages/tools must be the exact
+    inputs to the pressure estimator, ``_build_api_kwargs``, and the
+    ``llm_request`` middleware; ``_compress_context`` must not be called.
+    Canonical history keeps the original tool interaction.
+
+    This test is RED on the current code because the pre-API structured seam does
+    not yet exist; the pruning hook is never invoked, so compression fires on the
+    unpruned view.
+    """
+    cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    threshold = cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+    tool_result_content = "x" * ((threshold * 4) + 1024)
+    pruned_api_messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "search something"},
+    ]
+    effective_tools: list = []
+    accounting = {
+        "pruned_count": 1,
+        "saved_tokens": threshold * 4,
+        "redacted": [{"id": "call-web-1", "class": "terminal_tool_output"}],
+    }
+
+    _setup_pre_api_pruning_agent(agent, cfg)
+    agent._structured_context_prune = MagicMock(
+        side_effect=_make_pre_api_pruning_stub(
+            pruned_api_messages, effective_tools, accounting
+        )
+    )
+
+    tc = _mock_tool_call(name="web_search", arguments="{}", call_id="call-web-1")
+    resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+    resp2 = _mock_response(content="Done", finish_reason="stop")
+    agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+    build_api_kwargs_returned: list[dict] = []
+    mw_calls: list[dict] = []
+    estimate_messages_calls: list[list] = []
+    estimate_tools_calls: list[list] = []
+    original_build_api_kwargs = agent._build_api_kwargs
+    original_estimate_messages = _orig_estimate_messages_tokens_rough
+    original_estimate_tools = _orig_estimate_tools_tokens_rough
+
+    def _capture_build_api_kwargs(api_messages):
+        result = original_build_api_kwargs(api_messages)
+        build_api_kwargs_returned.append(result)
+        return result
+
+    def _capture_estimate_messages(api_messages):
+        estimate_messages_calls.append(list(api_messages))
+        return original_estimate_messages(api_messages)
+
+    def _capture_estimate_tools(tools):
+        estimate_tools_calls.append(list(tools))
+        return original_estimate_tools(tools)
+
+    def _capture_mw(api_kwargs, **_kwargs):
+        mw_calls.append(
+            {
+                "messages": list(api_kwargs.get("messages", [])),
+                "tools": list(api_kwargs.get("tools", [])),
+            }
+        )
+        return SimpleNamespace(
+            payload=api_kwargs, original_payload=dict(api_kwargs), trace=[]
+        )
+
+    with (
+        patch.object(
+            agent,
+            "_execute_tool_calls",
+            side_effect=_make_inject_huge_tool_result(tool_result_content),
+        ),
+        patch.object(
+            agent,
+            "_compress_context",
+            return_value=([{"role": "user", "content": "compressed"}], "SYSTEM"),
+        ) as mock_compress,
+        patch.object(
+            agent, "_build_api_kwargs", side_effect=_capture_build_api_kwargs
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            side_effect=_capture_estimate_messages,
+        ),
+        patch(
+            "agent.conversation_loop._estimate_tools_tokens_rough",
+            side_effect=_capture_estimate_tools,
+        ),
+        patch(
+            "hermes_cli.middleware.apply_llm_request_middleware",
+            side_effect=_capture_mw,
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "search something", conversation_history=[]
+        )
+
+    # The structured seam must be consulted once, during the pre-API phase.
+    agent._structured_context_prune.assert_called_once()
+    call_kwargs = agent._structured_context_prune.call_args.kwargs
+    assert call_kwargs.get("phase") == "pre_api"
+    assert call_kwargs.get("session_id") == agent.session_id
+
+    # Pruning lowered pressure, so compression is not required.
+    mock_compress.assert_not_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "Done"
+
+    # The exact effective view drove the pre-API pressure estimate.
+    assert len(estimate_messages_calls) == 2
+    assert estimate_messages_calls[1] == pruned_api_messages
+    assert len(estimate_tools_calls) == 2
+    assert estimate_tools_calls[1] == effective_tools
+
+    # The same effective view reached provider dispatch and llm_request middleware.
+    assert len(build_api_kwargs_returned) == 2
+    assert build_api_kwargs_returned[1]["messages"] == pruned_api_messages
+    assert build_api_kwargs_returned[1]["tools"] == effective_tools
+    assert len(mw_calls) == 2
+    assert mw_calls[1]["messages"] == pruned_api_messages
+    assert mw_calls[1]["tools"] == effective_tools
+
+    # Canonical history retains the full tool interaction (not mutated by pruning).
+    assert any(
+        msg.get("role") == "tool" and tool_result_content in msg.get("content", "")
+        for msg in result["messages"]
+    )
+
+
+def test_structured_pruning_pre_api_pressure_disabled_keeps_compression(agent):
+    """When structured pruning is disabled, the same over-threshold fixture must
+    still hit the existing pre-API compression path."""
+    cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+    cfg["tokenjuice_prompt_pruning_enabled"] = False
+
+    _setup_pre_api_pruning_agent(agent, cfg)
+    agent._structured_context_prune = MagicMock()
+
+    tc = _mock_tool_call(name="web_search", arguments="{}", call_id="call-web-1")
+    resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+    resp2 = _mock_response(content="Done", finish_reason="stop")
+    agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+    tool_result_content = "x" * (
+        (cfg["tokenjuice_prompt_pruning_threshold_tokens"] * 4) + 1024
+    )
+
+    with (
+        patch.object(
+            agent,
+            "_execute_tool_calls",
+            side_effect=_make_inject_huge_tool_result(tool_result_content),
+        ),
+        patch.object(
+            agent,
+            "_compress_context",
+            return_value=([{"role": "user", "content": "compressed"}], "SYSTEM"),
+        ) as mock_compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "search something", conversation_history=[]
+        )
+
+    agent._structured_context_prune.assert_not_called()
+    mock_compress.assert_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "Done"
+
+
+def test_structured_pruning_pre_api_pressure_missing_config_keeps_compression(agent):
+    """When no structured pruning config is present, the existing pre-API
+    compression path must run unchanged for the same over-threshold fixture."""
+    cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+
+    _setup_pre_api_pruning_agent(agent, None)
+    agent._structured_context_prune = MagicMock()
+
+    tc = _mock_tool_call(name="web_search", arguments="{}", call_id="call-web-1")
+    resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+    resp2 = _mock_response(content="Done", finish_reason="stop")
+    agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+    tool_result_content = "x" * (
+        (cfg["tokenjuice_prompt_pruning_threshold_tokens"] * 4) + 1024
+    )
+
+    with (
+        patch.object(
+            agent,
+            "_execute_tool_calls",
+            side_effect=_make_inject_huge_tool_result(tool_result_content),
+        ),
+        patch.object(
+            agent,
+            "_compress_context",
+            return_value=([{"role": "user", "content": "compressed"}], "SYSTEM"),
+        ) as mock_compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "search something", conversation_history=[]
+        )
+
+    agent._structured_context_prune.assert_not_called()
+    mock_compress.assert_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "Done"
 
 
 class TestHookPayloadSanitizesSimpleNamespace:

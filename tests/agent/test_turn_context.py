@@ -8,6 +8,8 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import copy
+import pathlib
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -15,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.model_metadata import estimate_request_tokens_rough
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -450,4 +453,368 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+_STRUCTURED_PRUNING_TEST_CONFIG: dict[str, bool | int | str] = {
+    "tokenjuice_prompt_pruning_enabled": True,
+    "tokenjuice_prompt_pruning_threshold_tokens": 8500,
+    "tokenjuice_prompt_pruning_trigger_ratio": 80,
+    "tokenjuice_prompt_pruning_target_ratio": 75,
+    "tokenjuice_prompt_pruning_soft_target_ratio": 75,
+    "tokenjuice_prompt_pruning_hard_target_ratio": 65,
+    "tokenjuice_prompt_pruning_min_saved_tokens": 256,
+    "tokenjuice_prompt_pruning_cache_ttl_seconds": 3600,
+    "tokenjuice_prompt_pruning_protect_recent_messages": 8,
+    "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 2,
+    "tokenjuice_prompt_pruning_classes": "terminal_tool_output",
+    "tokenjuice_prompt_pruning_accounting_enabled": True,
+}
+
+
+def _make_over_threshold_history_with_old_terminal(cfg: dict[str, bool | int | str]):
+    """Return a canonical history whose rough token pressure exceeds ``cfg`` threshold.
+
+    The pressure comes from one old, disposable terminal tool-result message. The
+    payload size is derived from the configured threshold so the fixture stays valid
+    under different test configs without hard-coding a character count.
+    """
+    threshold = cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+    min_saved = cfg["tokenjuice_prompt_pruning_min_saved_tokens"]
+    terminal_chars = (threshold + min_saved) * 4
+    return [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "I'll run a terminal command",
+            "tool_calls": [
+                {
+                    "id": "call-terminal-1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-terminal-1", "content": "x" * terminal_chars},
+    ]
+
+
+def _make_agent_for_structured_pruning_test(
+    tmp_path: pathlib.Path,
+    session_id: str,
+    cfg: dict[str, bool | int | str] | None = None,
+):
+    """Build a fake agent with compression enabled and an optional pruning config."""
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", session_id)
+    agent.compression_enabled = True
+    base_cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    agent.context_compressor.context_length = int(
+        base_cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+        / (base_cfg["tokenjuice_prompt_pruning_trigger_ratio"] / 100)
+    )
+    agent.context_compressor.threshold_tokens = base_cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+    agent.context_compressor.threshold_percent = base_cfg["tokenjuice_prompt_pruning_trigger_ratio"] / 100
+    agent._cached_system_prompt = "SYSTEM"
+    if cfg is not None:
+        agent._structured_pruning_config = cfg
+    return agent
+
+
+def test_structured_pruning_preflight_lowers_pressure_and_skips_compression(tmp_path):
+    """Given an over-threshold history with old terminal output and structured
+    pruning enabled via a test hook, the preflight gate must invoke the hook,
+    use the returned effective view for pressure estimation, skip compression,
+    and leave the canonical history unchanged.
+    """
+    cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    full_history = _make_over_threshold_history_with_old_terminal(cfg)
+    canonical_history_snapshot = copy.deepcopy(full_history)
+    system_prompt = "SYSTEM"
+    pruned_history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "[earlier turn]"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    def _prune_stub(_contributions, **kwargs):
+        return {
+            "effective_messages": pruned_history,
+            "effective_system_prompt": system_prompt,
+            "accounting": {
+                "pruned_count": 1,
+                "saved_tokens": cfg["tokenjuice_prompt_pruning_threshold_tokens"] * 4,
+                "redacted": [{"id": "call-terminal-1", "class": "terminal_tool_output"}],
+            },
+        }
+
+    agent = _make_agent_for_structured_pruning_test(tmp_path, "sess-prune", cfg)
+    agent._structured_context_prune = MagicMock(side_effect=_prune_stub)
+
+    ctx = _build(
+        agent,
+        user_message="hello",
+        conversation_history=full_history,
+        restore_or_build_system_prompt=lambda _a, _sm, _h: system_prompt,
+    )
+
+    agent._structured_context_prune.assert_called_once()
+    call_kwargs = agent._structured_context_prune.call_args.kwargs
+    assert call_kwargs.get("phase") == "preflight"
+    assert call_kwargs.get("session_id") == agent.session_id
+
+    pruned_pressure = estimate_request_tokens_rough(
+        pruned_history,
+        system_prompt=system_prompt,
+        tools=agent.tools or None,
+    )
+    assert pruned_pressure < cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+
+    assert ctx.messages == canonical_history_snapshot + [{"role": "user", "content": "hello"}]
+    assert full_history == canonical_history_snapshot
+    agent._compress_context.assert_not_called()
+
+
+def test_structured_pruning_preflight_disabled_keeps_existing_compression(tmp_path):
+    """When structured pruning is disabled, the existing preflight compression
+    path must run unchanged and the pruning hook must not be invoked.
+    """
+    cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+    cfg["tokenjuice_prompt_pruning_enabled"] = False
+    full_history = _make_over_threshold_history_with_old_terminal(cfg)
+
+    agent = _make_agent_for_structured_pruning_test(tmp_path, "sess-prune-disabled", cfg)
+    agent._structured_context_prune = MagicMock()
+
+    _build(
+        agent,
+        user_message="hello",
+        conversation_history=full_history,
+        restore_or_build_system_prompt=lambda _a, _sm, _h: "SYSTEM",
+    )
+
+    agent._structured_context_prune.assert_not_called()
+    agent._compress_context.assert_called()
+
+
+def test_structured_pruning_preflight_invalid_config_fails_open(tmp_path):
+    """An invalid structured-pruning config must fail open: no pruning hook
+    runs and the existing compression path remains available.
+    """
+    valid_cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    invalid_cfg = dict(valid_cfg)
+    invalid_cfg["tokenjuice_prompt_pruning_enabled"] = True
+    invalid_cfg["tokenjuice_prompt_pruning_trigger_ratio"] = "not-a-number"
+    full_history = _make_over_threshold_history_with_old_terminal(valid_cfg)
+
+    agent = _make_agent_for_structured_pruning_test(tmp_path, "sess-prune-invalid", None)
+    agent._structured_pruning_config = invalid_cfg
+    agent._structured_context_prune = MagicMock()
+
+    _build(
+        agent,
+        user_message="hello",
+        conversation_history=full_history,
+        restore_or_build_system_prompt=lambda _a, _sm, _h: "SYSTEM",
+    )
+
+    agent._structured_context_prune.assert_not_called()
+    agent._compress_context.assert_called()
+
+
+def test_structured_pruning_preflight_missing_config_keeps_existing_compression(tmp_path):
+    """When no structured pruning config is present, the existing preflight
+    compression path must run unchanged and the pruning hook must not be invoked.
+    """
+    cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    full_history = _make_over_threshold_history_with_old_terminal(cfg)
+
+    agent = _make_agent_for_structured_pruning_test(tmp_path, "sess-prune-missing")
+    agent._structured_context_prune = MagicMock()
+
+    _build(
+        agent,
+        user_message="hello",
+        conversation_history=full_history,
+        restore_or_build_system_prompt=lambda _a, _sm, _h: "SYSTEM",
+    )
+
+    agent._structured_context_prune.assert_not_called()
+    agent._compress_context.assert_called()
+
+
+class TestStructuredContributionModel:
+    """Red tests for the planned Hermes structured contribution model.
+
+    These exercise helpers that will live in ``agent/context_pruning.py`` and
+    model messages, tool interactions, and tool schemas as structured,
+    policy-aware contributions before any pruning decision.
+    """
+
+    def test_structured_contribution_message_fields(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        contributions = build_message_contributions(messages, phase="preflight")
+        assert isinstance(contributions, list) and len(contributions) == 2
+
+        required = {
+            "id",
+            "kind",
+            "provenance",
+            "class",
+            "stability",
+            "content_hash",
+            "cache_scope",
+            "token_estimate",
+            "char_count",
+            "atomic_group_id",
+            "prune_policy",
+            "protected_reason",
+        }
+        for contribution in contributions:
+            missing = required - contribution.keys()
+            assert not missing, f"contribution missing keys: {missing}"
+            assert contribution["kind"] == "message"
+            assert contribution["provenance"] == "conversation_history"
+            assert contribution["class"] in {"user_message", "assistant_message"}
+
+    def test_structured_contribution_tool_interaction_atomic_group(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "I'll run a terminal command",
+                "tool_calls": [
+                    {
+                        "id": "call-terminal-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-terminal-1", "content": "output"},
+        ]
+        contributions = build_message_contributions(messages, phase="pre_api")
+
+        tool_call_idx = next(
+            i
+            for i, c in enumerate(contributions)
+            if c["class"] == "assistant_message" and c.get("tool_calls")
+        )
+        result_idx = next(
+            i
+            for i, c in enumerate(contributions)
+            if c["class"] == "terminal_tool_output"
+        )
+        assert (
+            contributions[tool_call_idx]["atomic_group_id"]
+            == contributions[result_idx]["atomic_group_id"]
+        )
+        assert contributions[result_idx]["atomic_group_id"] == "call-terminal-1"
+
+    def test_structured_contribution_orphan_tool_results_protected(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [
+            {"role": "tool", "tool_call_id": "missing-call", "content": "orphan"},
+        ]
+        contributions = build_message_contributions(messages, phase="pre_api")
+
+        assert len(contributions) == 1
+        contribution = contributions[0]
+        assert contribution["class"] == "unknown"
+        assert contribution["prune_policy"] == "never"
+        assert contribution["atomic_group_id"] is None
+        assert "orphan tool result" in contribution["protected_reason"].lower()
+
+    def test_structured_contribution_tool_schema_atomic_groups(self):
+        from agent.context_pruning import build_tool_schema_contributions
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run a shell command.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+        contributions = build_tool_schema_contributions(tools)
+
+        assert len(contributions) == 2
+        for contribution in contributions:
+            assert contribution["kind"] == "tool_schema"
+            assert contribution["class"] == "tool_schema"
+            assert contribution["provenance"] == "tool_schema"
+            assert contribution["prune_policy"] == "never"
+            assert contribution["atomic_group_id"] is not None
+            assert isinstance(contribution["content_hash"], str)
+            assert len(contribution["content_hash"]) == 64
+
+    def test_structured_contribution_recent_messages_protected(self):
+        from agent.context_pruning import build_message_contributions
+
+        protect_recent = _STRUCTURED_PRUNING_TEST_CONFIG[
+            "tokenjuice_prompt_pruning_protect_recent_messages"
+        ]
+        messages = [
+            {"role": "user", "content": f"msg-{i:02d}"}
+            for i in range(protect_recent + 2)
+        ]
+        contributions = build_message_contributions(
+            messages,
+            phase="pre_api",
+            protect_recent_messages=protect_recent,
+        )
+
+        protected_ids = {
+            c["id"]
+            for c in contributions[-protect_recent:]
+            if c["class"] == "user_message"
+        }
+        for contribution in contributions[-protect_recent:]:
+            if contribution["id"] in protected_ids:
+                assert contribution["prune_policy"] == "never"
+                assert "recent" in contribution["protected_reason"].lower()
+
+    def test_structured_contribution_unknown_class_protected(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [{"role": "foobar", "content": "unrecognized role"}]
+        contributions = build_message_contributions(messages, phase="pre_api")
+
+        assert len(contributions) == 1
+        contribution = contributions[0]
+        assert contribution["class"] == "unknown"
+        assert contribution["prune_policy"] == "never"
+        assert "unknown" in contribution["protected_reason"].lower()
+
+    def test_structured_contribution_cache_scope_and_age_metadata(self):
+        from agent.context_pruning import build_message_contributions
+
+        messages = [{"role": "user", "content": "hello"}]
+        contributions = build_message_contributions(
+            messages,
+            phase="pre_api",
+            deterministic_now_epoch_ms=1_000_000,
+        )
+
+        assert len(contributions) == 1
+        contribution = contributions[0]
+        assert contribution["cache_scope"] in {"prefix", "body", "tail", "schema", "none"}
+        assert contribution.get("created_at_epoch_ms") is not None
+        assert isinstance(contribution["created_at_epoch_ms"], int)
 

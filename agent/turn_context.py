@@ -30,6 +30,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent.context_pruning import apply_structured_context_prune
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -571,10 +572,37 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
-        _preflight_tokens = estimate_request_tokens_rough(
-            messages,
-            system_prompt=active_system_prompt or "",
+        # Structured context-pruning seam (policy-free core).  A registered
+        # hook may return an effective view for pressure estimation; if it is
+        # disabled, malformed, or absent we fail open to the canonical view.
+        _pruned_view = apply_structured_context_prune(
+            agent,
+            phase="preflight",
+            messages=messages,
+            system_prompt=active_system_prompt,
             tools=agent.tools or None,
+            turn_id=turn_id,
+            task_id=effective_task_id,
+        )
+        _effective_messages = messages
+        _effective_system_prompt = active_system_prompt
+        _effective_tools = agent.tools
+        if _pruned_view is not None:
+            _effective_messages = _pruned_view.get("effective_messages", messages)
+            if not isinstance(_effective_messages, list):
+                _effective_messages = messages
+            _effective_system_prompt = (
+                _pruned_view.get("effective_system_prompt")
+                or active_system_prompt
+            )
+            _maybe_tools = _pruned_view.get("effective_tools")
+            if isinstance(_maybe_tools, list):
+                _effective_tools = _maybe_tools
+
+        _preflight_tokens = estimate_request_tokens_rough(
+            _effective_messages,
+            system_prompt=_effective_system_prompt or "",
+            tools=_effective_tools if _effective_tools is not None else (agent.tools or None),
         )
         _compressor = agent.context_compressor
         _defer_preflight = getattr(

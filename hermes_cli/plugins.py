@@ -157,6 +157,12 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Pre-pressure structured context-pruning hook. Runs before Hermes' preflight
+    # and pre-API token estimates; receives structured contributions and returns an
+    # effective pruned view plus accounting metadata.  Failing open is the hook's
+    # responsibility; core callers validate the returned shape and fall back to
+    # the unpruned canonical view.
+    "structured_context_prune",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",

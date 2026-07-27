@@ -1,9 +1,10 @@
 """Tests for agent/system_prompt.py — context-file cwd wiring."""
 
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -102,6 +103,248 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+_STRUCTURED_PRUNING_TEST_CONFIG: dict[str, bool | int | str] = {
+    "tokenjuice_prompt_pruning_enabled": True,
+    "tokenjuice_prompt_pruning_threshold_tokens": 8500,
+    "tokenjuice_prompt_pruning_trigger_ratio": 80,
+    "tokenjuice_prompt_pruning_target_ratio": 75,
+    "tokenjuice_prompt_pruning_soft_target_ratio": 75,
+    "tokenjuice_prompt_pruning_hard_target_ratio": 65,
+    "tokenjuice_prompt_pruning_min_saved_tokens": 256,
+    "tokenjuice_prompt_pruning_cache_ttl_seconds": 3600,
+    "tokenjuice_prompt_pruning_protect_recent_messages": 8,
+    "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 2,
+    "tokenjuice_prompt_pruning_classes": "terminal_tool_output",
+    "tokenjuice_prompt_pruning_accounting_enabled": True,
+}
+
+
+_REQUIRED_CONTRIBUTION_KEYS: frozenset[str] = frozenset({
+    "id",
+    "kind",
+    "provenance",
+    "class",
+    "stability",
+    "content_hash",
+    "cache_scope",
+    "token_estimate",
+    "char_count",
+    "atomic_group_id",
+    "prune_policy",
+    "protected_reason",
+})
+
+
+_KNOWN_CONTRIBUTION_KINDS: frozenset[str] = frozenset({
+    "system_part",
+    "developer_part",
+    "message",
+    "tool_interaction",
+    "tool_schema",
+    "prefill",
+    "memory_context",
+    "plugin_context",
+    "provider_control",
+})
+
+
+_KNOWN_PROVENANCES: frozenset[str] = frozenset({
+    "system_prompt",
+    "project_context",
+    "memory",
+    "skill",
+    "conversation_history",
+    "current_user",
+    "tool_result",
+    "tool_schema",
+    "gateway_note",
+    "plugin_pre_llm_call",
+})
+
+
+_KNOWN_CLASSES: frozenset[str] = frozenset({
+    "identity",
+    "system_instruction",
+    "project_context",
+    "memory_context",
+    "skill_context",
+    "developer_instruction",
+    "user_message",
+    "assistant_message",
+    "terminal_tool_output",
+    "exact_file_read",
+    "diagnostic",
+    "tool_schema",
+    "unknown",
+})
+
+
+_KNOWN_STABILITIES: frozenset[str] = frozenset({
+    "stable_prefix",
+    "session_stable",
+    "turn_ephemeral",
+    "volatile",
+    "unknown",
+})
+
+
+_KNOWN_CACHE_SCOPES: frozenset[str] = frozenset({
+    "prefix",
+    "body",
+    "tail",
+    "schema",
+    "none",
+})
+
+
+_KNOWN_PRUNE_POLICIES: frozenset[str] = frozenset({
+    "never",
+    "soft_trim",
+    "hard_clear_allowed",
+    "unknown",
+})
+
+
+_IDENTITY_TEXT = "TEST AGENT IDENTITY"
+_CONTEXT_TEXT = "TEST PROJECT CONTEXT"
+
+
+def _stable_agent_for_contribution_test():
+    """Return a deterministic agent whose system prompt is patched to stable text."""
+    agent = _make_agent(
+        load_soul_identity=True,
+        skip_context_files=False,
+        valid_tool_names=["read_file"],
+        platform="cli",
+    )
+    return agent
+
+
+def _build_current_prompt(agent):
+    """Build the joined system prompt the current production path produces."""
+    with (
+        patch("run_agent.load_soul_md", return_value=_IDENTITY_TEXT),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=_CONTEXT_TEXT),
+        patch("run_agent.build_skills_system_prompt", return_value=""),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        return build_system_prompt(agent)
+
+
+def _build_structured_contributions(agent, **kwargs):
+    """Call build_system_prompt_contributions with deterministic patches active."""
+    from agent.context_pruning import build_system_prompt_contributions
+
+    with (
+        patch("run_agent.load_soul_md", return_value=_IDENTITY_TEXT),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=_CONTEXT_TEXT),
+        patch("run_agent.build_skills_system_prompt", return_value=""),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        return build_system_prompt_contributions(agent, **kwargs)
+
+
+class TestStructuredSystemPromptContributions:
+    def test_system_prompt_join_byte_identical_when_structured_pruning_disabled(self):
+        """When structured pruning is disabled, the structured helper must join
+        to exactly the same bytes as the current production system prompt.
+        """
+        agent = _stable_agent_for_contribution_test()
+        current_joined = _build_current_prompt(agent)
+
+        contributions = _build_structured_contributions(
+            agent,
+            structured_pruning_enabled=False,
+        )
+        assert isinstance(contributions, list)
+
+        disabled_joined = "\n\n".join(
+            c["content"].strip()
+            for c in contributions
+            if c.get("content", "").strip()
+        )
+        assert disabled_joined == current_joined
+
+    def test_structured_contributions_before_system_prompt_join_include_required_fields(self):
+        """With structured pruning enabled, system-prompt parts must be
+        surfaced as structured contributions carrying the full metadata model.
+        """
+        agent = _stable_agent_for_contribution_test()
+
+        contributions = _build_structured_contributions(
+            agent,
+            structured_pruning_enabled=True,
+            test_config=_STRUCTURED_PRUNING_TEST_CONFIG,
+        )
+        assert contributions, "expected non-empty structured contributions"
+
+        for contribution in contributions:
+            missing = _REQUIRED_CONTRIBUTION_KEYS - contribution.keys()
+            assert not missing, f"contribution missing keys: {missing}"
+            assert contribution["kind"] in _KNOWN_CONTRIBUTION_KINDS
+            assert contribution["provenance"] in _KNOWN_PROVENANCES
+            assert contribution["class"] in _KNOWN_CLASSES
+            assert contribution["stability"] in _KNOWN_STABILITIES
+            assert contribution["cache_scope"] in _KNOWN_CACHE_SCOPES
+            assert contribution["prune_policy"] in _KNOWN_PRUNE_POLICIES
+            assert isinstance(contribution["content_hash"], str)
+            assert len(contribution["content_hash"]) == 64
+            assert isinstance(contribution["token_estimate"], int)
+            assert isinstance(contribution["char_count"], int)
+            assert contribution["char_count"] >= 0
+
+        stable_idx = next(
+            (
+                i
+                for i, c in enumerate(contributions)
+                if c["kind"] == "system_part" and c["provenance"] == "system_prompt"
+            ),
+            None,
+        )
+        assert stable_idx is not None
+
+        context_idx = next(
+            (
+                i
+                for i, c in enumerate(contributions)
+                if c["kind"] == "system_part" and c["provenance"] == "project_context"
+            ),
+            None,
+        )
+        assert context_idx is not None, "expected a project_context system_part contribution"
+        assert context_idx > stable_idx
+        context = contributions[context_idx]
+        assert context["char_count"] == len(_CONTEXT_TEXT)
+        assert context["token_estimate"] > 0
+        expected_hash = hashlib.sha256(_CONTEXT_TEXT.encode()).hexdigest()
+        assert context["content_hash"] == expected_hash
+
+    def test_structured_contributions_default_never_prune_identity_and_system(self):
+        """Default policy must mark identity and system instruction parts as
+        never-prune, even when structured pruning is enabled.
+        """
+        agent = _stable_agent_for_contribution_test()
+
+        contributions = _build_structured_contributions(
+            agent,
+            structured_pruning_enabled=True,
+            test_config=_STRUCTURED_PRUNING_TEST_CONFIG,
+        )
+        identity_system = [
+            c
+            for c in contributions
+            if c["class"] in {"identity", "system_instruction"}
+        ]
+        assert identity_system, "expected at least one identity/system contribution"
+        for contribution in identity_system:
+            assert contribution["prune_policy"] == "never"
+            assert contribution["protected_reason"]
 
 
 class TestTelegramRichMessagesHint:
