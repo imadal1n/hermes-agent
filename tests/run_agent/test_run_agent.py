@@ -6024,7 +6024,13 @@ def _setup_pre_api_pruning_agent(
 
 
 
-def _make_pre_api_pruning_stub(pruned_api_messages, effective_tools, accounting):
+def _make_pre_api_pruning_stub(
+    pruned_api_messages,
+    effective_tools,
+    accounting,
+    *,
+    effective_system_prompt=None,
+):
     """Return a stub matching the future structured-pruning seam contract."""
     _required_contribution_keys = {"id", "kind", "class", "token_estimate"}
 
@@ -6043,9 +6049,13 @@ def _make_pre_api_pruning_stub(pruned_api_messages, effective_tools, accounting)
         return {
             "effective_messages": pruned_api_messages,
             "effective_system_prompt": (
-                pruned_api_messages[0].get("content", "")
-                if pruned_api_messages
-                else ""
+                effective_system_prompt
+                if effective_system_prompt is not None
+                else (
+                    pruned_api_messages[0].get("content", "")
+                    if pruned_api_messages
+                    else ""
+                )
             ),
             "effective_tools": effective_tools,
             "accounting": accounting,
@@ -6190,6 +6200,58 @@ def test_structured_pruning_pre_api_pressure_lowers_and_skips_compression(agent)
         msg.get("role") == "tool" and tool_result_content in msg.get("content", "")
         for msg in result["messages"]
     )
+
+
+def test_structured_pruning_effective_system_prompt_is_request_scoped(agent):
+    cfg = _STRUCTURED_PRUNING_TEST_CONFIG
+    threshold = cfg["tokenjuice_prompt_pruning_threshold_tokens"]
+    tool_result_content = "x" * ((threshold * 4) + 1024)
+    pruned_api_messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "search something"},
+    ]
+    accounting = {
+        "pruned_count": 1,
+        "saved_tokens": threshold * 4,
+        "redacted": [{"id": "call-web-1", "class": "terminal_tool_output"}],
+    }
+
+    _setup_pre_api_pruning_agent(agent, cfg)
+    agent._structured_context_prune = MagicMock(
+        side_effect=_make_pre_api_pruning_stub(
+            pruned_api_messages,
+            [],
+            accounting,
+            effective_system_prompt="",
+        )
+    )
+
+    tc = _mock_tool_call(name="web_search", arguments="{}", call_id="call-web-1")
+    resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+    resp2 = _mock_response(content="Done", finish_reason="stop")
+    agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+    with (
+        patch.object(
+            agent,
+            "_execute_tool_calls",
+            side_effect=_make_inject_huge_tool_result(tool_result_content),
+        ),
+        patch.object(agent, "_compress_context") as mock_compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search something", conversation_history=[])
+
+    mock_compress.assert_not_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "Done"
+    create_calls = agent.client.chat.completions.create.call_args_list
+    assert len(create_calls) == 2
+    second_call_messages = create_calls[1].kwargs.get("messages")
+    assert second_call_messages[0] == {"role": "system", "content": "SYSTEM"}
+    assert agent._cached_system_prompt == "SYSTEM"
 
 
 def test_structured_pruning_pre_api_pressure_disabled_keeps_compression(agent):

@@ -1111,9 +1111,6 @@ def run_conversation(
                 if isinstance(_maybe_messages, list):
                     _effective_messages = _maybe_messages
                     api_messages = _effective_messages
-                _maybe_system_prompt = _pruned_view.get("effective_system_prompt")
-                if isinstance(_maybe_system_prompt, str):
-                    active_system_prompt = _maybe_system_prompt
                 _maybe_tools = _pruned_view.get("effective_tools")
                 if isinstance(_maybe_tools, list):
                     _effective_tools = _maybe_tools
