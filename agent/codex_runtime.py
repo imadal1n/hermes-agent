@@ -123,7 +123,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     if compressor is not None:
         try:
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
+            if (
+                isinstance(context_window, int)
+                and context_window > 0
+                and getattr(compressor, "context_length", None) != context_window
+            ):
                 update_model = getattr(compressor, "update_model", None)
                 if callable(update_model):
                     update_model(
