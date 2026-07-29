@@ -669,6 +669,82 @@ def test_structured_pruning_preflight_missing_config_keeps_existing_compression(
     agent._compress_context.assert_called()
 
 
+def test_structured_pruning_preflight_discovers_plugin_before_native_compression(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[str] = []
+    cfg = dict(_STRUCTURED_PRUNING_TEST_CONFIG)
+    cfg["tokenjuice_prompt_pruning_threshold_tokens"] = 316_200
+    cfg["tokenjuice_prompt_pruning_trigger_ratio"] = 80
+    full_history = [{"role": "user", "content": "pressure"}]
+    pruned_history = [{"role": "user", "content": "small"}]
+
+    plugins = types.ModuleType("hermes_cli.plugins")
+    discovered = False
+
+    def discover_plugins() -> None:
+        nonlocal discovered
+        events.append("discover")
+        discovered = True
+
+    def has_hook(name: str) -> bool:
+        events.append(f"has:{name}:{discovered}")
+        return discovered and name == "structured_context_prune"
+
+    def invoke_hook(name: str, **kwargs):
+        if name != "structured_context_prune":
+            return []
+        events.append(f"invoke:{name}")
+        assert kwargs["current_pressure_tokens"] == 391_733
+        assert kwargs["threshold_tokens"] == 316_200
+        assert kwargs["trigger_tokens"] == 252_960
+        return [{"effective_messages": pruned_history}]
+
+    setattr(plugins, "discover_plugins", discover_plugins)
+    setattr(plugins, "has_hook", has_hook)
+    setattr(plugins, "invoke_hook", invoke_hook)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+
+    agent = _make_agent_for_structured_pruning_test(tmp_path, "sess-prune-plugin", cfg)
+    agent.context_compressor.context_length = 372_000
+    agent.context_compressor.threshold_tokens = 316_200
+    agent.context_compressor.threshold_percent = 0.85
+
+    def estimate(messages, **_kwargs):
+        if messages == pruned_history:
+            events.append("estimate:pruned")
+            return 237_000
+        events.append("estimate:canonical")
+        return 391_733
+
+    def should_compress(tokens: int) -> bool:
+        events.append(f"should:{tokens}")
+        return tokens >= agent.context_compressor.threshold_tokens
+
+    agent.context_compressor.should_compress = MagicMock(side_effect=should_compress)
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", side_effect=estimate), \
+         patch("agent.context_pruning.time.time", return_value=1_000.0):
+        ctx = _build(
+            agent,
+            user_message="hello",
+            conversation_history=full_history,
+            restore_or_build_system_prompt=lambda _a, _sm, _h: "SYSTEM",
+        )
+
+    assert ctx.messages == full_history + [{"role": "user", "content": "hello"}]
+    assert events[0] == "estimate:canonical"
+    assert events.index("discover") < events.index("has:structured_context_prune:True")
+    assert events.index("has:structured_context_prune:True") < events.index(
+        "invoke:structured_context_prune"
+    )
+    assert events.index("invoke:structured_context_prune") < events.index("should:237000")
+    assert "should:391733" not in events
+    agent._compress_context.assert_not_called()
+
+
 class TestStructuredContributionModel:
     """Red tests for the planned Hermes structured contribution model.
 

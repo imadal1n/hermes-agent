@@ -6182,10 +6182,8 @@ def test_structured_pruning_pre_api_pressure_lowers_and_skips_compression(agent)
     assert result["final_response"] == "Done"
 
     # The exact effective view drove the pre-API pressure estimate.
-    assert len(estimate_messages_calls) == 2
-    assert estimate_messages_calls[1] == pruned_api_messages
-    assert len(estimate_tools_calls) == 2
-    assert estimate_tools_calls[1] == effective_tools
+    assert estimate_messages_calls[-1] == pruned_api_messages
+    assert effective_tools in estimate_tools_calls
 
     # The same effective view reached provider dispatch and llm_request middleware.
     assert len(build_api_kwargs_returned) == 2

@@ -482,8 +482,9 @@ def _resolve_structured_prune_hook(agent: Any) -> Optional[Any]:
         return hook
 
     try:
-        from hermes_cli.plugins import has_hook, invoke_hook
+        from hermes_cli.plugins import discover_plugins, has_hook, invoke_hook
 
+        discover_plugins()
         if has_hook("structured_context_prune"):
             return lambda contributions, **kwargs: _first_result(
                 invoke_hook("structured_context_prune", contributions=contributions, **kwargs)
