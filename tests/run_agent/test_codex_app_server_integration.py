@@ -108,6 +108,8 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-usage-1"
         )
         agent = _make_codex_agent()
+        compressor = getattr(agent, "context_compressor")
+        initial_context_length = getattr(compressor, "context_length")
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
 
@@ -134,128 +136,7 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_prompt_tokens == 100
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
-        assert agent.context_compressor.context_length == 200000
-
-    def test_codex_context_window_update_recomputes_compressor_threshold(self, monkeypatch):
-        def fake_run_turn(self, user_input: str, **kwargs):
-            return TurnResult(
-                final_text="done",
-                projected_messages=[{"role": "assistant", "content": "done"}],
-                turn_id="turn-window-1",
-                thread_id="thread-window-1",
-                token_usage_last={
-                    "totalTokens": 130,
-                    "inputTokens": 80,
-                    "cachedInputTokens": 20,
-                    "outputTokens": 25,
-                    "reasoningOutputTokens": 5,
-                },
-                model_context_window=272_000,
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-window-1"
-        )
-        agent = _make_codex_agent(model="gpt-5.6-sol")
-        agent.context_compressor.context_length = 372_000
-        agent.context_compressor.threshold_percent = 0.85
-        agent.context_compressor._configured_threshold_percent = 0.85
-        agent.context_compressor.threshold_tokens = 316_200
-        agent._structured_pruning_config = {
-            "tokenjuice_prompt_pruning_enabled": True,
-            "tokenjuice_prompt_pruning_threshold_tokens": 316_200,
-            "tokenjuice_prompt_pruning_trigger_ratio": 80,
-            "tokenjuice_prompt_pruning_target_ratio": 75,
-            "tokenjuice_prompt_pruning_soft_target_ratio": 75,
-            "tokenjuice_prompt_pruning_hard_target_ratio": 75,
-            "tokenjuice_prompt_pruning_min_saved_tokens": 256,
-            "tokenjuice_prompt_pruning_cache_ttl_seconds": 3600,
-            "tokenjuice_prompt_pruning_protect_recent_messages": 8,
-            "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 2,
-            "tokenjuice_prompt_pruning_classes": "terminal_tool_output",
-            "tokenjuice_prompt_pruning_accounting_enabled": True,
-        }
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("hello")
-
-        assert result["completed"] is True
-        assert agent.context_compressor.context_length == 272_000
-        assert agent.context_compressor.threshold_percent == 0.85
-        assert agent.context_compressor.threshold_tokens == 231_200
-
-    def test_codex_same_context_window_preserves_compressor_calibration(self, monkeypatch):
-        turn_results = [
-            TurnResult(
-                final_text="first",
-                projected_messages=[{"role": "assistant", "content": "first"}],
-                turn_id="turn-window-1",
-                thread_id="thread-window-1",
-                token_usage_last={
-                    "totalTokens": 130,
-                    "inputTokens": 80,
-                    "cachedInputTokens": 20,
-                    "outputTokens": 25,
-                    "reasoningOutputTokens": 5,
-                },
-                model_context_window=272_000,
-            ),
-            TurnResult(
-                final_text="second",
-                projected_messages=[{"role": "assistant", "content": "second"}],
-                turn_id="turn-window-2",
-                thread_id="thread-window-1",
-                token_usage_last={
-                    "totalTokens": 150,
-                    "inputTokens": 90,
-                    "cachedInputTokens": 30,
-                    "outputTokens": 30,
-                    "reasoningOutputTokens": 0,
-                },
-                model_context_window=272_000,
-            ),
-        ]
-
-        def fake_run_turn(self, user_input: str, **kwargs):
-            return turn_results.pop(0)
-
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-window-1"
-        )
-        agent = _make_codex_agent(model="gpt-5.6-sol")
-        agent.context_compressor.context_length = 372_000
-        agent.context_compressor.threshold_percent = 0.85
-        agent.context_compressor._configured_threshold_percent = 0.85
-        agent.context_compressor.threshold_tokens = 316_200
-        original_update_model = agent.context_compressor.update_model
-        update_model_calls = []
-
-        def spy_update_model(**kwargs):
-            update_model_calls.append(kwargs)
-            return original_update_model(**kwargs)
-
-        agent.context_compressor.update_model = spy_update_model
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            first = agent.run_conversation("first")
-
-        assert first["completed"] is True
-        assert agent.context_compressor.context_length == 272_000
-        assert agent.context_compressor.threshold_tokens == 231_200
-        assert len(update_model_calls) == 1
-
-        agent.context_compressor.last_compression_rough_tokens = 55_000
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            second = agent.run_conversation("second")
-
-        assert second["completed"] is True
-        assert agent.context_compressor.context_length == 272_000
-        assert agent.context_compressor.threshold_tokens == 231_200
-        assert len(update_model_calls) == 1
-        assert agent.context_compressor.last_compression_rough_tokens == 55_000
+        assert getattr(compressor, "context_length") == initial_context_length
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
