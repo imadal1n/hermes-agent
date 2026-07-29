@@ -1096,6 +1096,11 @@ def run_conversation(
         _effective_messages = api_messages
         _effective_tools = agent.tools
         _original_tools = agent.tools
+        _original_approx_tokens = estimate_messages_tokens_rough(api_messages)
+        _original_request_pressure_tokens = _original_approx_tokens + (
+            _estimate_tools_tokens_rough(agent.tools) if agent.tools is not None else 0
+        )
+        _pruned_view = None
         if agent.compression_enabled and len(messages) > 1:
             _pruned_view = apply_structured_context_prune(
                 agent,
@@ -1105,6 +1110,7 @@ def run_conversation(
                 tools=agent.tools or None,
                 turn_id=turn_id,
                 task_id=effective_task_id,
+                current_pressure_tokens=_original_request_pressure_tokens,
             )
             if _pruned_view is not None:
                 _maybe_messages = _pruned_view.get("effective_messages", api_messages)
@@ -1115,10 +1121,14 @@ def run_conversation(
                 if isinstance(_maybe_tools, list):
                     _effective_tools = _maybe_tools
 
-        approx_tokens = estimate_messages_tokens_rough(_effective_messages)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(_effective_tools) if _effective_tools is not None else 0
-        )
+        if _pruned_view is None:
+            approx_tokens = _original_approx_tokens
+            request_pressure_tokens = _original_request_pressure_tokens
+        else:
+            approx_tokens = estimate_messages_tokens_rough(_effective_messages)
+            request_pressure_tokens = approx_tokens + (
+                _estimate_tools_tokens_rough(_effective_tools) if _effective_tools is not None else 0
+            )
         total_chars = approx_tokens * 4
 
         _compressor = agent.context_compressor

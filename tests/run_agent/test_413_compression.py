@@ -1400,6 +1400,79 @@ class TestStructuredPruningDelaysCompaction:
             for p in preflight_pressures
         )
 
+    def test_pre_api_passes_original_pressure_and_live_threshold_to_hook(self, agent):
+        cfg = {
+            **_STRUCTURED_PRUNING_TEST_CONFIG,
+            "tokenjuice_prompt_pruning_threshold_tokens": 316_200,
+            "tokenjuice_prompt_pruning_target_ratio": 75,
+            "tokenjuice_prompt_pruning_soft_target_ratio": 75,
+            "tokenjuice_prompt_pruning_hard_target_ratio": 75,
+            "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 0,
+        }
+        _setup_structured_pruning_agent(agent, cfg)
+        agent.context_compressor.context_length = 272_000
+        agent.context_compressor.threshold_percent = 0.85
+        agent.context_compressor.threshold_tokens = 231_200
+        expected_pressure = 242_508
+        original_messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        pruned_messages = [
+            *original_messages,
+            {"role": "user", "content": "run terminal"},
+        ]
+        calls: list[dict] = []
+
+        def _hook(contributions, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["current_pressure_tokens"] == expected_pressure
+            assert kwargs["threshold_tokens"] == 231_200
+            assert kwargs["trigger_tokens"] == 184_960
+            return _pruned_view(pruned_messages, [])
+
+        agent._structured_context_prune = _hook
+        tc = SimpleNamespace(
+            id="call-terminal-pressure",
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments="{}"),
+        )
+        agent.valid_tool_names = {"terminal"}
+        agent.tools = _make_tool_defs("terminal")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+
+        def _inject_terminal_result(assistant_message, messages, effective_task_id, api_call_count=0):
+            messages.append({
+                "role": "tool",
+                "tool_call_id": "call-terminal-pressure",
+                "name": "terminal",
+                "content": "x",
+            })
+
+        pressure_values = [100, expected_pressure, 100]
+
+        def _estimate_messages(_messages):
+            return pressure_values.pop(0)
+
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=_inject_terminal_result),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_estimate_messages),
+            patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
+        ):
+            result = agent.run_conversation("run terminal", conversation_history=original_messages)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+        assert len(calls) == 2
+        mock_compress.assert_not_called()
+
     def test_soft_pressure_preflight_avoids_compression(self, agent):
         """Soft pressure at the preflight gate is pruned before compression fires."""
         cfg = _STRUCTURED_PRUNING_TEST_CONFIG
@@ -1460,8 +1533,8 @@ class TestStructuredPruningDelaysCompaction:
         assert result["completed"] is True
         mock_compress.assert_not_called()
         # Both gates consumed pruned pressure below the trigger.
-        assert all(p < trigger_tokens for p in preflight_pressures)
-        assert all(p < trigger_tokens for p in pre_api_msg_pressures)
+        assert preflight_pressures[-1] < trigger_tokens
+        assert pre_api_msg_pressures[-1] < trigger_tokens
         assert all(t < trigger_tokens for t in should_compress_inputs if t is not None)
         provider_messages = agent.client.chat.completions.create.call_args.kwargs.get("messages", [])
         assert provider_messages == pruned_messages
@@ -1562,7 +1635,7 @@ class TestStructuredPruningDelaysCompaction:
         assert result["final_response"] == "Done"
         mock_compress.assert_not_called()
         # The second (post-tool) pre-API estimate consumed the pruned view.
-        assert all(p < trigger_tokens for p in pre_api_msg_pressures)
+        assert pre_api_msg_pressures[-1] < trigger_tokens
         assert all(t < trigger_tokens for t in should_compress_inputs if t is not None)
         create_calls = agent.client.chat.completions.create.call_args_list
         assert len(create_calls) == 2
@@ -1618,7 +1691,7 @@ class TestStructuredPruningDelaysCompaction:
 
         assert result["completed"] is True
         mock_compress.assert_not_called()
-        assert all(p < trigger_tokens for p in preflight_pressures)
+        assert preflight_pressures[-1] < trigger_tokens
         assert conversation_history == canonical_snapshot
 
     def test_hard_pressure_falls_back_to_compression_when_candidates_insufficient(self, agent):

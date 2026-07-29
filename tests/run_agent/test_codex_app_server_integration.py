@@ -136,6 +136,55 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
 
+    def test_codex_context_window_update_recomputes_compressor_threshold(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-window-1",
+                thread_id="thread-window-1",
+                token_usage_last={
+                    "totalTokens": 130,
+                    "inputTokens": 80,
+                    "cachedInputTokens": 20,
+                    "outputTokens": 25,
+                    "reasoningOutputTokens": 5,
+                },
+                model_context_window=272_000,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-window-1"
+        )
+        agent = _make_codex_agent(model="gpt-5.6-sol")
+        agent.context_compressor.context_length = 372_000
+        agent.context_compressor.threshold_percent = 0.85
+        agent.context_compressor._configured_threshold_percent = 0.85
+        agent.context_compressor.threshold_tokens = 316_200
+        agent._structured_pruning_config = {
+            "tokenjuice_prompt_pruning_enabled": True,
+            "tokenjuice_prompt_pruning_threshold_tokens": 316_200,
+            "tokenjuice_prompt_pruning_trigger_ratio": 80,
+            "tokenjuice_prompt_pruning_target_ratio": 75,
+            "tokenjuice_prompt_pruning_soft_target_ratio": 75,
+            "tokenjuice_prompt_pruning_hard_target_ratio": 75,
+            "tokenjuice_prompt_pruning_min_saved_tokens": 256,
+            "tokenjuice_prompt_pruning_cache_ttl_seconds": 3600,
+            "tokenjuice_prompt_pruning_protect_recent_messages": 8,
+            "tokenjuice_prompt_pruning_protect_recent_tool_interactions": 2,
+            "tokenjuice_prompt_pruning_classes": "terminal_tool_output",
+            "tokenjuice_prompt_pruning_accounting_enabled": True,
+        }
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert agent.context_compressor.context_length == 272_000
+        assert agent.context_compressor.threshold_percent == 0.85
+        assert agent.context_compressor.threshold_tokens == 231_200
+
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -786,4 +835,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

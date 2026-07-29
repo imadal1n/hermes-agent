@@ -575,6 +575,11 @@ def build_turn_context(
         # Structured context-pruning seam (policy-free core).  A registered
         # hook may return an effective view for pressure estimation; if it is
         # disabled, malformed, or absent we fail open to the canonical view.
+        _original_preflight_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
         _pruned_view = apply_structured_context_prune(
             agent,
             phase="preflight",
@@ -583,6 +588,7 @@ def build_turn_context(
             tools=agent.tools or None,
             turn_id=turn_id,
             task_id=effective_task_id,
+            current_pressure_tokens=_original_preflight_tokens,
         )
         _effective_messages = messages
         _effective_system_prompt = active_system_prompt
@@ -601,11 +607,14 @@ def build_turn_context(
             if isinstance(_maybe_tools, list):
                 _effective_tools = _maybe_tools
 
-        _preflight_tokens = estimate_request_tokens_rough(
-            _effective_messages,
-            system_prompt=_effective_system_prompt or "",
-            tools=_effective_tools if _effective_tools is not None else (agent.tools or None),
-        )
+        if _pruned_view is None:
+            _preflight_tokens = _original_preflight_tokens
+        else:
+            _preflight_tokens = estimate_request_tokens_rough(
+                _effective_messages,
+                system_prompt=_effective_system_prompt or "",
+                tools=_effective_tools if _effective_tools is not None else (agent.tools or None),
+            )
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,

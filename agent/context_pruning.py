@@ -522,6 +522,7 @@ def apply_structured_context_prune(
     api_request_id: Optional[str] = None,
     turn_id: Optional[str] = None,
     task_id: Optional[str] = None,
+    current_pressure_tokens: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Invoke the registered structured pruning hook and return the effective view.
 
@@ -539,7 +540,8 @@ def apply_structured_context_prune(
         return None
 
     compressor = getattr(agent, "context_compressor", None)
-    threshold_tokens = int(config.get("tokenjuice_prompt_pruning_threshold_tokens", 0))
+    live_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    threshold_tokens = live_threshold or int(config.get("tokenjuice_prompt_pruning_threshold_tokens", 0))
     context_length = int(getattr(compressor, "context_length", 0) or 0)
     trigger_ratio = float(config["tokenjuice_prompt_pruning_trigger_ratio"]) / 100.0
     trigger_tokens = int(threshold_tokens * trigger_ratio)
@@ -574,6 +576,7 @@ def apply_structured_context_prune(
             context_length=context_length,
             threshold_tokens=threshold_tokens,
             trigger_tokens=trigger_tokens,
+            current_pressure_tokens=current_pressure_tokens,
             tool_schema_tokens=tool_schema_tokens,
             now_epoch_ms=int(time.time() * 1000),
         )
