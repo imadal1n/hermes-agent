@@ -9674,6 +9674,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
+        if queued_event.receipt is not None:
+            queued_event.receipt_deferred = True
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
@@ -10790,10 +10792,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    async def _strict_gateway_event_matches_session(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        active_session_id: Optional[str] = None,
+    ) -> bool:
+        metadata = getattr(event, "metadata", None) or {}
+        if not bool(metadata.get("gateway_session_strict")):
+            return True
+
+        expected_session_key = str(metadata.get("gateway_session_key") or "").strip()
+        pinned_session_id = str(metadata.get("gateway_session_id") or "").strip()
+        if (
+            not expected_session_key
+            or expected_session_key != session_key
+            or not pinned_session_id
+            or (active_session_id is not None and active_session_id != pinned_session_id)
+        ):
+            return False
+
+        session_entry = await self.async_session_store.lookup_by_session_key(
+            expected_session_key
+        )
+        return bool(
+            session_entry is not None
+            and session_entry.session_id == pinned_session_id
+        )
+
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.UNAVAILABLE))
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10834,7 +10867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -10842,9 +10875,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -10898,7 +10934,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
             return True  # handled (silently dropped); do not fall through
+
+        running_agent = self._session_state(session_key).turn.agent
+        active_session_id = getattr(running_agent, "session_id", None)
+        if not await self._strict_gateway_event_matches_session(
+            event,
+            session_key,
+            active_session_id=active_session_id,
+        ):
+            logger.warning(
+                "Dropping strictly routed busy event after session replacement: %s",
+                session_key,
+            )
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
 
@@ -10911,7 +10964,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
+                if not self._queue_or_replace_pending_event(session_key, event):
+                    return True
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
@@ -11027,6 +11081,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        if event.receipt is not None:
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 
@@ -11138,8 +11196,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
-        if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+        if (
+            not steered
+            and not redirected
+            and not self._queue_or_replace_pending_event(session_key, event)
+        ):
+            return True
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -12536,6 +12598,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if queue is None:
             queue = []
             self._startup_restore_queue = queue
+        if event.receipt is not None:
+            event.receipt_deferred = True
         queue.append(event)
         try:
             source = event.source
@@ -12562,6 +12626,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Dropping startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
+                if event.receipt is not None:
+                    event.receipt.complete(DeliveryOutcome(DeliveryStatus.UNAVAILABLE))
                 continue
             # Mark this replay so _handle_message does not queue it again while
             # the restore gate remains closed for any fresh inbound arrivals.
@@ -12569,8 +12635,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
-            await adapter.handle_message(event)
-            drained += 1
+            try:
+                await adapter.handle_message(event)
+                drained += 1
+            except asyncio.CancelledError:
+                if event.receipt is not None:
+                    event.receipt.complete(DeliveryOutcome(DeliveryStatus.CANCELLED))
+                raise
+            except Exception as exc:
+                if event.receipt is not None:
+                    event.receipt.complete(
+                        DeliveryOutcome(
+                            DeliveryStatus.DELIVERY_FAILED,
+                            error=type(exc).__name__,
+                        )
+                    )
+                logger.warning(
+                    "Startup-restore queued message replay failed",
+                    exc_info=True,
+                )
         return drained
 
     def _start_startup_warmup(self) -> None:
@@ -18779,7 +18862,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    if not self._queue_or_replace_pending_event(_quick_key, event):
+                        return None
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -20489,6 +20573,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     expected_session_key,
                     derived_session_key,
                 )
+                if event.receipt is not None:
+                    event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
                 return
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
@@ -20508,6 +20594,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pinned_session_id or "missing",
                     expected_session_key or "missing",
                 )
+                if event.receipt is not None:
+                    event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
                 return
         else:
             # Internal wakes must observe reset policy without becoming user
@@ -28593,6 +28681,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
+    def _discard_pending_session_events(
+        self,
+        session_key: str,
+        *,
+        adapter: Any = None,
+    ) -> None:
+        pending_events: List[MessageEvent] = []
+        adapters = (
+            [adapter]
+            if adapter is not None
+            else list((getattr(self, "adapters", None) or {}).values())
+        )
+        for candidate in adapters:
+            pending_slot = getattr(candidate, "_pending_messages", None)
+            if isinstance(pending_slot, dict):
+                pending_event = pending_slot.pop(session_key, None)
+                if pending_event is not None:
+                    pending_events.append(pending_event)
+
+        state = self._peek_session_state(session_key)
+        if state is not None:
+            pending_events.extend(state.conversation.queued_events)
+            state.conversation.queued_events = []
+
+        for pending_event in pending_events:
+            receipt = getattr(pending_event, "receipt", None)
+            if receipt is not None:
+                receipt.complete(DeliveryOutcome(DeliveryStatus.CANCELLED))
+
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """Clear ALL conversation-scoped per-session state for ``session_key``.
 
@@ -28627,6 +28744,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
+        self._discard_pending_session_events(session_key)
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
@@ -28808,8 +28926,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+        self._discard_pending_session_events(session_key, adapter=adapter)
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
@@ -31442,6 +31559,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
+            if (
+                result
+                and adapter
+                and session_key
+                and _interrupt_depth >= self._MAX_INTERRUPT_DEPTH
+                and self._queue_depth(session_key, adapter=adapter) > 0
+            ):
+                logger.warning(
+                    "Interrupt recursion depth %d reached for session %s — "
+                    "leaving queued messages for the adapter drain.",
+                    _interrupt_depth,
+                    session_key,
+                )
+                return result_holder[0] or {
+                    "final_response": response,
+                    "messages": history,
+                }
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
@@ -31723,6 +31857,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    if not await self._strict_gateway_event_matches_session(
+                        pending_event,
+                        next_session_key,
+                        active_session_id=session_id,
+                    ):
+                        logger.warning(
+                            "Dropping queued strictly routed event after session replacement: %s",
+                            next_session_key or "?",
+                        )
+                        if pending_event.receipt is not None:
+                            pending_event.receipt.complete(
+                                DeliveryOutcome(DeliveryStatus.REJECTED)
+                            )
+                        return result
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -31730,6 +31878,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=next_session_key,
                     )
                     if next_message is None:
+                        if pending_event.receipt is not None:
+                            pending_event.receipt.complete(
+                                DeliveryOutcome(DeliveryStatus.REJECTED)
+                            )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -31777,22 +31929,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                    delivery_receipt=(
-                        pending_event.receipt if pending_event is not None else None
-                    ),
+                followup_receipt = (
+                    pending_event.receipt if pending_event is not None else None
                 )
+                if pending_event is not None:
+                    if not await self._strict_gateway_event_matches_session(
+                        pending_event,
+                        next_session_key,
+                        active_session_id=session_id,
+                    ):
+                        if followup_receipt is not None:
+                            followup_receipt.complete(
+                                DeliveryOutcome(DeliveryStatus.REJECTED)
+                            )
+                        return result
+                if run_generation is not None and not self._is_session_run_current(
+                    session_key, run_generation
+                ):
+                    if followup_receipt is not None:
+                        followup_receipt.complete(
+                            DeliveryOutcome(DeliveryStatus.CANCELLED)
+                        )
+                    return result
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                        delivery_receipt=followup_receipt,
+                    )
+                except asyncio.CancelledError:
+                    if followup_receipt is not None:
+                        followup_receipt.complete(
+                            DeliveryOutcome(DeliveryStatus.CANCELLED)
+                        )
+                    raise
+                except Exception as exc:
+                    if followup_receipt is not None:
+                        followup_receipt.complete(
+                            DeliveryOutcome(
+                                DeliveryStatus.DELIVERY_FAILED,
+                                error=type(exc).__name__,
+                            )
+                        )
+                    raise
                 combined_result = _preserve_queued_followup_history_offset(
                     result, followup_result
                 )

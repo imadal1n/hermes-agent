@@ -3,11 +3,13 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.receipts import DeliveryOutcome, DeliveryReceipt, DeliveryStatus
 from gateway.session import SessionSource
 
 
@@ -149,3 +151,56 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+
+
+@pytest.mark.asyncio
+async def test_queued_strict_followup_rechecks_session_immediately_before_dispatch(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._strict_gateway_event_matches_session = AsyncMock(
+        side_effect=[True, False]
+    )
+    receipt = DeliveryReceipt()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+        text="stale queued turn",
+        source=source,
+        metadata={"gateway_session_strict": True},
+        receipt=receipt,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-before-rotation",
+        session_key="agent:main:telegram:group:-1001",
+    )
+
+    assert result["final_response"] == "done-1"
+    assert CaptureQueuedNativeImageAgent.calls == ["hello"]
+    assert runner._strict_gateway_event_matches_session.await_count == 2
+    assert await receipt.wait() == DeliveryOutcome(DeliveryStatus.REJECTED)
