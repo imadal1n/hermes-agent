@@ -3014,11 +3014,18 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
     utf16_len,
+)
+from gateway.receipts import (
+    MAX_DELIVERY_RESPONSE_CHARS,
+    DeliveryOutcome,
+    DeliveryReceipt,
+    DeliveryStatus,
 )
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
@@ -14195,6 +14202,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
+        from gateway.rabbit_ingress import RabbitIngressConfig, RabbitIngressServer
+
+        rabbit_config = RabbitIngressConfig.from_environment()
+        if rabbit_config is not None:
+            self._rabbit_ingress = RabbitIngressServer(self, rabbit_config)
+            try:
+                if not await self._rabbit_ingress.start():
+                    logger.warning(
+                        "Rabbit ingress unavailable: Matrix adapter or session binding missing"
+                    )
+                    self._rabbit_ingress = None
+            except BaseException:
+                self._running = False
+                raise
+
         try:
             await self._ensure_hosted_room_worker()
         except Exception:
@@ -16063,6 +16085,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._clear_plugin_message_injector()
             self._draining = True
+
+            rabbit_ingress = getattr(self, "_rabbit_ingress", None)
+            if rabbit_ingress is not None:
+                await rabbit_ingress.stop()
+                self._rabbit_ingress = None
 
             stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
             if callable(stop_room_worker):
@@ -18183,9 +18210,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                if event.receipt is not None:
+                    event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -22177,8 +22208,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                delivery_receipt=event.receipt,
                 message_type=event.message_type,
             )
+            propagated_receipt = agent_result.get("_delivery_receipt")
+            if propagated_receipt is not None:
+                event.final_delivery_receipt = propagated_receipt
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -22795,7 +22830,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the return value, so stash the delivered text on the event
                 # or those hooks never run and a /loop tick stays awaiting.
                 try:
-                    event._streamed_final_response = str(response or "")
+                    streamed_text = (
+                        _strip_response_attachments_for_direct_send(
+                            str(response or ""),
+                            _media_adapter,
+                        )
+                        if _media_adapter is not None
+                        else str(response or "")
+                    )
+                    event._streamed_final_response = streamed_text[
+                        :MAX_DELIVERY_RESPONSE_CHARS
+                    ]
                 except Exception:
                     pass
                 return None
@@ -24310,10 +24355,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
+    ) -> tuple[SendResult, str]:
         """Deliver a queued response using the normal text+attachment split."""
+        delivery_result = SendResult(success=True)
+        text_content = _strip_response_attachments_for_direct_send(response, adapter)
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
                 # Reconcile-by-edit first (live finding, 2026-08-16 canary):
                 # when the stream consumer delivered/sealed a message but its
@@ -24349,7 +24395,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    delivery_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
@@ -24360,7 +24406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return delivery_result, text_content[:MAX_DELIVERY_RESPONSE_CHARS]
 
         synthetic_event = MessageEvent(
             text="",
@@ -24373,6 +24419,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter,
             thread_metadata=metadata,
         )
+        return delivery_result, text_content[:MAX_DELIVERY_RESPONSE_CHARS]
 
     async def _run_background_task(
         self,
@@ -29958,6 +30005,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        delivery_receipt: Optional[DeliveryReceipt] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -29978,6 +30026,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                delivery_receipt=delivery_receipt,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -29991,6 +30040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                delivery_receipt=delivery_receipt,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -30134,6 +30184,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        delivery_receipt: Optional[DeliveryReceipt] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31473,6 +31524,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None and pending_event.receipt is not None:
+                    pending_event.receipt.complete(
+                        DeliveryOutcome(DeliveryStatus.SHUTDOWN)
+                    )
                 pending_event = None
                 pending = None
 
@@ -31545,6 +31600,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
+                        if delivery_receipt is not None:
+                            delivery_receipt.complete(
+                                DeliveryOutcome(DeliveryStatus.NO_RESPONSE)
+                            )
                     elif first_response:
                         try:
                             if _already_streamed:
@@ -31557,7 +31616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
+                            queued_delivery, receipt_response = await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
                                 adapter=adapter,
@@ -31567,8 +31626,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
                             )
+                            if delivery_receipt is not None:
+                                if queued_delivery.success:
+                                    delivery_receipt.complete(
+                                        DeliveryOutcome(
+                                            DeliveryStatus.DELIVERED,
+                                            response=receipt_response,
+                                        )
+                                    )
+                                else:
+                                    delivery_receipt.complete(
+                                        DeliveryOutcome(
+                                            DeliveryStatus.DELIVERY_FAILED,
+                                            response=receipt_response,
+                                            error=queued_delivery.error,
+                                        )
+                                    )
                         except Exception as e:
+                            if delivery_receipt is not None:
+                                delivery_receipt.complete(
+                                    DeliveryOutcome(
+                                        DeliveryStatus.DELIVERY_FAILED,
+                                        response=_strip_response_attachments_for_direct_send(
+                                            first_response, adapter
+                                        )[:MAX_DELIVERY_RESPONSE_CHARS],
+                                        error=type(e).__name__,
+                                    )
+                                )
                             logger.warning("Failed to send first response before queued message: %s", e)
+                    elif delivery_receipt is not None:
+                        delivery_receipt.complete(
+                            DeliveryOutcome(DeliveryStatus.NO_RESPONSE)
+                        )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -31594,7 +31683,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     await _bg_result
                             except Exception:
                                 pass
-                # else: interrupted — discard the interrupted response ("Operation
+                else:
+                    if delivery_receipt is not None:
+                        delivery_receipt.complete(
+                            DeliveryOutcome(DeliveryStatus.CANCELLED)
+                        )
+                # interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
@@ -31695,8 +31789,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    delivery_receipt=(
+                        pending_event.receipt if pending_event is not None else None
+                    ),
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                combined_result = _preserve_queued_followup_history_offset(
+                    result, followup_result
+                )
+                propagated_receipt = followup_result.get("_delivery_receipt")
+                if propagated_receipt is not None:
+                    combined_result["_delivery_receipt"] = propagated_receipt
+                elif pending_event is not None and pending_event.receipt is not None:
+                    combined_result["_delivery_receipt"] = pending_event.receipt
+                return combined_result
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

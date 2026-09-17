@@ -622,6 +622,12 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.receipts import (
+    MAX_DELIVERY_RESPONSE_CHARS,
+    DeliveryOutcome,
+    DeliveryReceipt,
+    DeliveryStatus,
+)
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -2515,6 +2521,14 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Optional event-scoped final-delivery receipt. Appended for positional
+    # construction compatibility.
+    receipt: Optional[DeliveryReceipt] = None
+
+    # Receipt for the last queued turn delivered by an in-band run chain.
+    # The original receipt remains attached to its root event.
+    final_delivery_receipt: Optional[DeliveryReceipt] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -6251,6 +6265,8 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.UNAVAILABLE))
             return
 
         if event.allow_gateway_control:
@@ -6282,6 +6298,8 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
+            if event.receipt is not None:
+                event.receipt.complete(DeliveryOutcome(DeliveryStatus.REJECTED))
             return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
@@ -6491,14 +6509,17 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_error: Optional[str] = None
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_error
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_error = str(getattr(result, "error", "") or "delivery failed")
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6549,6 +6570,7 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            receipt_response = None
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -6649,6 +6671,12 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                receipt_response = (
+                    text_content[:MAX_DELIVERY_RESPONSE_CHARS]
+                    if text_content
+                    else None
+                )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
@@ -7053,6 +7081,34 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
 
+            final_receipt = event.final_delivery_receipt or event.receipt
+            if final_receipt is not None:
+                streamed_response = getattr(event, "_streamed_final_response", None)
+                if delivery_attempted and not delivery_succeeded:
+                    final_receipt.complete(
+                        DeliveryOutcome(
+                            DeliveryStatus.DELIVERY_FAILED,
+                            response=receipt_response,
+                            error=delivery_error,
+                        )
+                    )
+                elif delivery_succeeded:
+                    final_receipt.complete(
+                        DeliveryOutcome(
+                            DeliveryStatus.DELIVERED,
+                            response=receipt_response,
+                        )
+                    )
+                elif streamed_response:
+                    final_receipt.complete(
+                        DeliveryOutcome(
+                            DeliveryStatus.DELIVERED,
+                            response=str(streamed_response)[:MAX_DELIVERY_RESPONSE_CHARS],
+                        )
+                    )
+                else:
+                    final_receipt.complete(DeliveryOutcome(DeliveryStatus.NO_RESPONSE))
+
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
             # this task hand off the follow-up.
@@ -7098,6 +7154,9 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            final_receipt = event.final_delivery_receipt or event.receipt
+            if final_receipt is not None:
+                final_receipt.complete(DeliveryOutcome(DeliveryStatus.CANCELLED))
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -7105,6 +7164,14 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            final_receipt = event.final_delivery_receipt or event.receipt
+            if final_receipt is not None:
+                final_receipt.complete(
+                    DeliveryOutcome(
+                        DeliveryStatus.DELIVERY_FAILED,
+                        error=type(e).__name__,
+                    )
+                )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
