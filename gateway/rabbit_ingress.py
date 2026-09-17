@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -17,6 +17,39 @@ from gateway.session import SessionEntry
 
 
 _ENV_PREFIX: Final = "HERMES_RABBIT_INGRESS_"
+
+RabbitErrorCode: TypeAlias = Literal[
+    "cancelled",
+    "delivery_failed",
+    "invalid_request",
+    "rejected",
+    "response_too_large",
+    "shutdown",
+    "timeout",
+    "unavailable",
+]
+
+
+def _wire_error(status: DeliveryStatus, *, present: bool) -> RabbitErrorCode | None:
+    if not present:
+        return None
+    match status:
+        case DeliveryStatus.CANCELLED:
+            return "cancelled"
+        case DeliveryStatus.DELIVERY_FAILED:
+            return "delivery_failed"
+        case DeliveryStatus.INVALID_REQUEST:
+            return "invalid_request"
+        case DeliveryStatus.REJECTED:
+            return "rejected"
+        case DeliveryStatus.SHUTDOWN:
+            return "shutdown"
+        case DeliveryStatus.TIMEOUT:
+            return "timeout"
+        case DeliveryStatus.UNAVAILABLE:
+            return "unavailable"
+        case DeliveryStatus.DELIVERED | DeliveryStatus.NO_RESPONSE:
+            return "delivery_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +77,7 @@ class RabbitIngressConfig(BaseModel):
     matrix_room_id: str = Field(min_length=1)
     matrix_user_id: str = Field(min_length=1)
     request_timeout_seconds: float = Field(gt=0)
-    max_frame_bytes: int = Field(gt=0)
+    max_frame_bytes: int = Field(ge=128)
     allowed_peer_uid: int | None = Field(default=None, ge=0)
 
     @field_validator("socket_path")
@@ -91,7 +124,7 @@ class RabbitResponse(BaseModel):
     request_id: str
     status: DeliveryStatus
     response: str | None = None
-    error: str | None = None
+    error: RabbitErrorCode | None = None
 
 
 class RabbitSessionStore(Protocol):
@@ -217,13 +250,13 @@ class RabbitIngressServer:
             source=origin,
             user_id=origin.user_id,
             user_name=origin.user_name,
-            message_id=request.request_id,
             metadata={
                 "gateway_session_key": entry.session_key,
                 "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
                 "rabbit_ingress": True,
             },
+            allow_gateway_control=False,
             receipt=receipt,
         )
         try:
@@ -274,9 +307,21 @@ class RabbitIngressServer:
                 request_id=request_id,
                 status=outcome.status,
                 response=outcome.response,
-                error=outcome.error,
+                error=_wire_error(outcome.status, present=outcome.error is not None),
             )
-            writer.write(payload.model_dump_json(exclude_none=True).encode() + b"\n")
+            encoded = payload.model_dump_json(exclude_none=True).encode() + b"\n"
+            if len(encoded) > self._config.max_frame_bytes:
+                encoded = (
+                    RabbitResponse(
+                        request_id="",
+                        status=DeliveryStatus.DELIVERY_FAILED,
+                        error="response_too_large",
+                    )
+                    .model_dump_json(exclude_none=True)
+                    .encode()
+                    + b"\n"
+                )
+            writer.write(encoded)
             await writer.drain()
         except (BrokenPipeError, ConnectionError):
             return

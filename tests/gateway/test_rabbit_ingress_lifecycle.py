@@ -181,5 +181,5 @@ async def test_unix_ingress_rejects_unauthorized_peer(tmp_path) -> None:
         "protocol_version": 1,
         "request_id": "",
         "status": "rejected",
-        "error": "peer rejected",
+        "error": "rejected",
     }

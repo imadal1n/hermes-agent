@@ -99,7 +99,11 @@ async def test_unix_ingress_dispatches_through_bound_matrix_event(tmp_path) -> N
     }
     assert runner.adapter.event is not None
     assert runner.adapter.event.source == source
+    assert runner.adapter.event.message_id is None
     assert runner.adapter.event.metadata["gateway_session_key"] == entry.session_key
+    assert runner.adapter.event.allow_gateway_control is False
+    runner.adapter.event.text = "/restart"
+    assert runner.adapter.event.is_command() is False
     assert not socket_path.exists()
 
 
@@ -174,8 +178,108 @@ async def test_unix_ingress_sanitizes_invalid_request_error(tmp_path) -> None:
         "protocol_version": 1,
         "request_id": "",
         "status": "invalid_request",
-        "error": "invalid request",
+        "error": "invalid_request",
     }
+
+
+@pytest.mark.asyncio
+async def test_unix_ingress_replaces_raw_delivery_error_with_fixed_code(tmp_path) -> None:
+    source = _source()
+    entry = SessionEntry(
+        session_key="matrix:bound",
+        session_id="session-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+    )
+    runner = _Runner(entry)
+
+    async def fail_delivery(event: MessageEvent) -> None:
+        assert event.receipt is not None
+        event.receipt.complete(
+            DeliveryOutcome(
+                DeliveryStatus.DELIVERY_FAILED,
+                error="secret-token=do-not-expose",
+            )
+        )
+
+    runner.adapter.handle_message = fail_delivery
+    socket_path = tmp_path / "rabbit.sock"
+    server = RabbitIngressServer(
+        runner,
+        RabbitIngressConfig(
+            enabled=True,
+            socket_path=socket_path,
+            session_key=entry.session_key,
+            matrix_room_id=source.chat_id,
+            matrix_user_id=source.user_id or "",
+            request_timeout_seconds=1.0,
+            max_frame_bytes=4096,
+        ),
+    )
+    await server.start()
+
+    response = await _request(
+        str(socket_path),
+        {"protocol_version": 1, "request_id": "r3", "text": "hello"},
+    )
+    await server.stop()
+
+    assert response == {
+        "protocol_version": 1,
+        "request_id": "r3",
+        "status": "delivery_failed",
+        "error": "delivery_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unix_ingress_bounds_complete_response_frame(tmp_path) -> None:
+    source = _source()
+    entry = SessionEntry(
+        session_key="matrix:bound",
+        session_id="session-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+    )
+    runner = _Runner(entry)
+
+    async def deliver_large_response(event: MessageEvent) -> None:
+        assert event.receipt is not None
+        event.receipt.complete(
+            DeliveryOutcome(DeliveryStatus.DELIVERED, response="x" * 500)
+        )
+
+    runner.adapter.handle_message = deliver_large_response
+    socket_path = tmp_path / "rabbit.sock"
+    server = RabbitIngressServer(
+        runner,
+        RabbitIngressConfig(
+            enabled=True,
+            socket_path=socket_path,
+            session_key=entry.session_key,
+            matrix_room_id=source.chat_id,
+            matrix_user_id=source.user_id or "",
+            request_timeout_seconds=1.0,
+            max_frame_bytes=128,
+        ),
+    )
+    await server.start()
+
+    response = await _request(
+        str(socket_path),
+        {"protocol_version": 1, "request_id": "r4", "text": "hello"},
+    )
+    await server.stop()
+
+    assert response == {
+        "protocol_version": 1,
+        "request_id": "",
+        "status": "delivery_failed",
+        "error": "response_too_large",
+    }
+    assert len(json.dumps(response).encode()) <= 128
 
 
 @pytest.mark.asyncio
