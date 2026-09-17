@@ -2529,6 +2529,10 @@ class MessageEvent:
     # Receipt for the last queued turn delivered by an in-band run chain.
     # The original receipt remains attached to its root event.
     final_delivery_receipt: Optional[DeliveryReceipt] = None
+
+    # True only while this same event has been handed to a later queued turn.
+    # The current adapter frame must not complete its receipt before that turn.
+    receipt_deferred: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -5864,6 +5868,7 @@ class BasePlatformAdapter(ABC):
             getattr(self, "_busy_text_mode", "interrupt") == "queue"
             and event.message_type == MessageType.TEXT
             and not getattr(event, "internal", False)
+            and event.receipt is None
             and not event.is_command()
             and bool((event.text or "").strip())
         )
@@ -5878,6 +5883,23 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
+
+        if existing.receipt is not None or event.receipt is not None:
+            return False
+        existing_security = (
+            existing.internal,
+            existing.allow_gateway_control,
+            existing.metadata.get("gateway_session_strict"),
+            existing.metadata.get("rabbit_ingress"),
+        )
+        incoming_security = (
+            event.internal,
+            event.allow_gateway_control,
+            event.metadata.get("gateway_session_strict"),
+            event.metadata.get("rabbit_ingress"),
+        )
+        if existing_security != incoming_security:
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -6506,6 +6528,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        event.receipt_deferred = False
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -7082,7 +7105,9 @@ class BasePlatformAdapter(ABC):
             )
 
             final_receipt = event.final_delivery_receipt or event.receipt
-            if final_receipt is not None:
+            receipt_deferred = event.receipt_deferred
+            event.receipt_deferred = False
+            if final_receipt is not None and not receipt_deferred:
                 streamed_response = getattr(event, "_streamed_final_response", None)
                 if delivery_attempted and not delivery_succeeded:
                     final_receipt.complete(
@@ -7155,7 +7180,9 @@ class BasePlatformAdapter(ABC):
                 
         except asyncio.CancelledError:
             final_receipt = event.final_delivery_receipt or event.receipt
-            if final_receipt is not None:
+            receipt_deferred = event.receipt_deferred
+            event.receipt_deferred = False
+            if final_receipt is not None and not receipt_deferred:
                 final_receipt.complete(DeliveryOutcome(DeliveryStatus.CANCELLED))
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
@@ -7165,7 +7192,9 @@ class BasePlatformAdapter(ABC):
             raise
         except BaseException as e:
             final_receipt = event.final_delivery_receipt or event.receipt
-            if final_receipt is not None:
+            receipt_deferred = event.receipt_deferred
+            event.receipt_deferred = False
+            if final_receipt is not None and not receipt_deferred:
                 final_receipt.complete(
                     DeliveryOutcome(
                         DeliveryStatus.DELIVERY_FAILED,
